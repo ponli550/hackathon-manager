@@ -1,0 +1,7 @@
+prompts/
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+BOARD.md
+.wrangler/

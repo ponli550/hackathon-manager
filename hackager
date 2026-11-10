@@ -1,0 +1,3109 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import re
+import os
+import shlex
+import shutil
+import tempfile
+import html as html_mod
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+MANIFEST = "hackathon.json"
+# `event` is the hackathon's URL -- what `next` needs to know to tell an agent
+# what to fetch. Everything `set` accepts; nothing else gets into the JSON.
+MANIFEST_KEYS = ("name", "one_liner", "problem", "market", "track", "source", "demo",
+                 "status", "event", "deadline")
+SELF = Path(__file__).resolve()
+SELF_DIR = SELF.parent.name
+DEFAULT = object()
+
+
+def root(args_dir):
+    return args_dir if args_dir is not DEFAULT else default_root()
+
+DEMO_RE = re.compile(
+    r"(https?://[^\s\)\]\"']+(?:youtu\.be/|youtube\.com|loom\.com|"
+    # workers.dev added on hard evidence, not a guess: LabHack and VeriPay
+    # both have a real, bolded, deployed demo link in their own README.md --
+    # the exact file this regex scans -- that the old host list dropped
+    # silently. Their readiness score read "missing: demo" for a demo that
+    # was sitting in the one file already being read.
+    r"vercel\.app|github\.io|streamlit\.app|huggingface\.co|workers\.dev|pages\.dev)"
+    r"[^\s\)\]\"']*)",
+    re.I,
+)
+
+SUBMISSION_DOCS = {"submission", "pitch", "demo", "deploy",
+                   "devnet_proof", "runbook", "scaffold"}
+
+
+def submission_files(p):
+    """Every file that counts as submission material -- not one exact name.
+    Checked in the project root AND its docs/ dir, since every real project
+    that has this material keeps it in one or the other."""
+    out = []
+    for base in (p, p / "docs"):
+        if not base.is_dir():
+            continue
+        for f in base.glob("*.md"):
+            stem = f.stem.lower().replace("-", "_")
+            if stem in SUBMISSION_DOCS:
+                out.append(f)
+    return out
+
+
+def project_docs(proj):
+    """Where hackager's OUTPUT for a project goes: the project's own docs/,
+    not hackathon-manager/. Caught on the first real hackathon run (TenTen):
+    `pitch` wrote cards/TenTen-Tencent-pitch.md under the manager, and the
+    agent driving it then had to hand-copy that into TenTen's docs/PITCH.md
+    and commit it -- the tool put the deliverable in the one place it could
+    not be submitted from. Same for slides and pdf. The project is the unit
+    of submission; its artifacts live with it."""
+    d = Path(proj["path"]) / "docs"
+    d.mkdir(exist_ok=True)
+    return d
+
+
+def pitch_card(proj):
+    """The project's pitch doc, if it has one: docs/PITCH.md by preference
+    (what new/fix scaffold), else whatever submission-shaped doc it does keep."""
+    preferred = Path(proj["path"]) / "docs" / "PITCH.md"
+    if preferred.is_file():
+        return preferred
+    found = submission_files(Path(proj["path"]))
+    return found[0] if found else None
+
+
+SCAFFOLD_MARK = "(who hurts: one named role"
+
+
+def is_scaffold(path):
+    """True if a PITCH.md is still the untouched skeleton new/fix wrote --
+    safe to replace. Anything a human has edited is not."""
+    try:
+        return SCAFFOLD_MARK in path.read_text()
+    except OSError:
+        return False
+
+
+# Tool internals -- the prompt actually sent and claude's raw JSON reply --
+# stay under the manager (gitignored). They are for debugging the wrapper,
+# not for a judge, and dropping them in the project would dirty its tree.
+INTERNALS = SELF.parent / "prompts"
+
+
+STACKS = [
+    ("Cargo.toml", "Rust"),
+    ("go.mod", "Go"),
+    ("package.json", "JS/Node"),
+    ("pyproject.toml", "Py"),
+    ("setup.py", "Py"),
+    ("requirements.txt", "Py"),
+    ("Dockerfile", "Container"),
+    ("docker-compose.yml", "Container"),
+    ("extension/manifest.json", "Chrome-ext"),
+]
+
+TRACKS = ["devtools", "agent", "fintech", "gen-ai", "open-source", "design", "other"]
+
+
+def git_env():
+    """The environment with git's repo-pointing variables removed.
+
+    `git -C <path>` does NOT win against an exported GIT_DIR/GIT_WORK_TREE --
+    those take precedence, so every git call here silently retargets whatever
+    repo the surrounding shell was pointed at. Caught for real: run from a
+    shell holding the dotfiles bare repo in GIT_DIR, `hackager commit
+    <project>` tried to commit that project's files into ~/.dotfiles, and only
+    a stale index.lock stopped it. A tool that writes to git must say which
+    repo itself, not inherit the answer."""
+    env = os.environ.copy()
+    for k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+              "GIT_COMMON_DIR", "GIT_NAMESPACE"):
+        env.pop(k, None)
+    return env
+
+
+def git(cwd, args):
+    try:
+        return subprocess.run(
+            ["git", "-C", str(cwd), *args],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env=git_env(),
+        ).stdout.strip()
+    except (subprocess.SubprocessError, OSError):
+        return ""
+
+
+def scan_project(path):
+    # .resolve() before anything reads p.name. Path(".").name is the empty
+    # string and Path("..").name is literally "..", so `hackager slides .`
+    # from inside a project wrote docs/.pptx -- a hidden dotfile, silently,
+    # with no error and nothing to notice until you went looking for the deck.
+    #
+    # Fixed here rather than in slides because the name is used everywhere:
+    # the prompt and raw-reply files under prompts/, <name>-verify.json,
+    # <name>-build.txt, the board's first column and therefore the panel's
+    # {row}. Every one of them was equally wrong for a relative path; slides
+    # was just the one that left visible evidence.
+    p = Path(path).resolve()
+    md_files = [
+        f for f in p.rglob("*.md")
+        if "node_modules" not in f.parts and ".git" not in f.parts
+    ]
+    readme = p / "README.md"
+    submission = p / "SUBMISSION.md"
+    submission_docs = submission_files(p)
+    manifest = p / MANIFEST
+
+    def read(path, n=1):
+        try:
+            return " ".join(path.read_text(errors="replace").split("\n")[:n]).strip()
+        except OSError:
+            return ""
+
+    demo = []
+    for f in (readme, submission):
+        try:
+            demo += DEMO_RE.findall(f.read_text(errors="replace"))
+        except OSError:
+            continue
+    # .strip() alone left a trailing ** on any URL written as markdown
+    # bold (**https://...**) -- not visible on every row, only on ones short
+    # enough that cmd_board's [:40] truncation does not already cut it off
+    # first (VeriPay showed it, LabHack's longer domain coincidentally did not).
+    demo = list(dict.fromkeys(url.strip().strip("*_") for url in demo))
+
+    stack = []
+    for fname, label in STACKS:
+        if (p / fname).is_file():
+            stack.append(label)
+
+    branch = ""
+    dirty = 0
+    last_commit = ""
+    remote = ""
+    if (p / ".git").exists():
+        branch = git(p, ["rev-parse", "--abbrev-ref", "HEAD"])
+        dirty = len([l for l in git(p, ["status", "--porcelain"]).splitlines() if l])
+        raw = git(p, ["log", "-1", "--format=%cI"])
+        try:
+            last_commit = datetime.fromisoformat(raw).strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            last_commit = raw
+        # Not gated behind `init` -- a public repo is a fact about the
+        # project whether or not anyone has run `init` to write a
+        # hackathon.json yet. Was only ever fetched inside cmd_init, so
+        # readiness's own "source" gate had nothing real to check against
+        # for any project that hadn't been init'd -- which, until now, was
+        # all six of them.
+        remote = git(p, ["remote", "get-url", "origin"])
+
+    out = {
+        "name": p.name,
+        "path": str(p),
+        "git": (p / ".git").exists(),
+        "branch": branch,
+        "dirty": dirty,
+        "last_commit": last_commit,
+        "remote": remote,
+        "readme_one_liner": read(readme),
+        "readme_lines": None,
+        "submission": submission.is_file() or bool(submission_docs),
+        "submission_docs": [str(f) for f in submission_docs],
+        "docs_articles": len([f for f in md_files
+                              if f != readme and f != submission and f not in submission_docs]),
+        "demo_links": demo,
+        "stack": stack,
+        "license": (p / "LICENSE").is_file() or (p / "LICENSE.md").is_file(),
+        "manifest": load_manifest(manifest),
+    }
+    return out
+
+
+def load_manifest(path):
+    if not path.is_file():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def readiness(proj):
+    m = proj["manifest"] or {}
+    # Was computed and passed back as `ok` by every caller and used by none --
+    # dead output, the exact "not real logic" shape everything else here had.
+    # A real gate now: source counts if a manifest says so explicitly, OR the
+    # project actually has a git remote, which `scan_project` now checks
+    # unconditionally rather than only when `hackathon.json` exists.
+    steps = {
+        "readme": bool(proj["readme_one_liner"]),
+        "submission": bool(proj["submission"]),
+        "demo": bool(proj["demo_links"]),
+        "source": bool(m.get("source") or proj.get("remote")),
+        "license": bool(proj["license"]),
+        "clean": proj["dirty"] == 0,
+    }
+    done = sum(1 for v in steps.values() if v)
+    state = "ready" if done == len(steps) else f"{done}/{len(steps)}"
+    return state, steps
+
+
+def discover(root):
+    root = Path(root).expanduser()
+    found = []
+    for child in sorted(root.iterdir()):
+        if not child.is_dir() or child.name.startswith("."):
+            continue
+        if child.name.lower() == SELF_DIR.lower():
+            continue
+        if child.name in ("node_modules", "venv", ".venv", "__pycache__"):
+            continue
+        if not any((child / s).exists() for s in ("README.md", MANIFEST, "package.json",
+                                                  "pyproject.toml", "requirements.txt",
+                                                  "Dockerfile", ".git")):
+            continue
+        found.append(child)
+    return found
+
+
+def cmd_scan(args):
+    projects = [scan_project(p) for p in discover(root(args.dir))]
+    manifest = {
+        "tool": "hackager",
+        "scanned_at": datetime.now().isoformat(timespec="seconds"),
+        "root": str(Path(root(args.dir)).resolve()),
+        "count": len(projects),
+        "projects": projects,
+    }
+    if args.json:
+        print(json.dumps(manifest, indent=2))
+    else:
+        for p in projects:
+            state, steps = readiness(p)
+            print(f"{p['name']:24} {state:12} docs={p['docs_articles']} dirty={p['dirty']} "
+                  f"{','.join(p['stack']) or '-'}")
+    return 0
+
+
+def cmd_report(args):
+    projects = [scan_project(p) for p in discover(root(args.dir))]
+    rows = []
+    for p in projects:
+        state, steps = readiness(p)
+        m = p["manifest"] or {}
+        one = m.get("market") or ""
+        rows.append({
+            "name": p["name"],
+            "state": state,
+            "one_liner": m.get("one_liner") or p["readme_one_liner"],
+            "market": one,
+            "track": m.get("track", ""),
+            "source": m.get("source") or p["remote"],
+            "demo": (m.get("demo") or p["demo_links"][:1] or [""])[0] if (m.get("demo") or p["demo_links"]) else "",
+            "missing": ", ".join(k for k, ok in steps.items() if not ok) or "-",
+            "last_commit": p["last_commit"],
+            "stack": ",".join(p["stack"]),
+        })
+    ready = [r for r in rows if r["state"] == "ready"]
+    if args.json:
+        print(json.dumps({"ts": datetime.now().isoformat(timespec="seconds"),
+                          "total": len(rows), "ready": len(ready), "projects": rows}, indent=2))
+        return 0
+    print(f"{'PROJECT':24} {'STATE':12} MISSING / DETAIL")
+    for r in rows:
+        print(f"{r['name']:24} {r['state']:12} {r['missing']}")
+        if r["one_liner"]:
+            print(f"{'':24} {'':12} {r['one_liner'][:88]}")
+    print(f"\n{len(ready)}/{len(rows)} submission-ready")
+    return 0
+
+
+MIT_LICENSE = """MIT License
+
+Copyright (c) {year} {author}
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+"""
+
+
+def git_author():
+    # git config, not a placeholder -- a LICENSE with a fabricated name is
+    # worse than one you have to fill in yourself.
+    name = git(".", ["config", "user.name"]) or git(".", ["config", "--global", "user.name"])
+    return name or "(unset -- run `git config --global user.name` first)"
+
+
+def write_license(path, force=False):
+    """Real MIT text, not a stub. Returns True if it wrote one."""
+    lic = path / "LICENSE"
+    if lic.exists() and not force:
+        return False
+    lic.write_text(MIT_LICENSE.format(year=datetime.now().year, author=git_author()))
+    return True
+
+
+PITCH_SCAFFOLD = """## {name}
+{one_liner}
+
+## The person
+(who hurts: one named role, one scene -- a shop owner on the 30th, a bookkeeper with nine clients)
+
+## The loss
+(what it costs them, with a number and where the number comes from -- never a feeling)
+
+## Why now
+(what changed: a rule, a mandate, a technology, a price)
+
+## What it does
+(one sentence, then how, in words the person above would use)
+
+## Why this is not a wrapper / chatbot / dashboard
+(the part a judge cannot get from calling an API themselves)
+
+## Who pays
+(the buyer, not the user, if they differ)
+
+## Demo (3 steps, under 2 minutes)
+1.
+2.
+3.
+"""
+
+
+def write_pitch_scaffold(path, name, force=False):
+    """A real skeleton with the judge-card's own headings, not fake content --
+    every heading is a prompt to fill in, same honesty as init's blank
+    manifest fields. Only written if NO submission-shaped doc exists yet;
+    never overwrites real material someone already wrote."""
+    docs = path / "docs"
+    target = docs / "PITCH.md"
+    if (submission_files(path) or (path / "SUBMISSION.md").is_file()) and not force:
+        return None
+    docs.mkdir(exist_ok=True)
+    target.write_text(PITCH_SCAFFOLD.format(name=name, one_liner=f"({name} in one sentence)"))
+    return target
+
+
+def cmd_init(args):
+    path = Path(args.project).expanduser()
+    if not path.is_dir():
+        print(f"no such project: {path}", file=sys.stderr)
+        return 1
+    target = path / MANIFEST
+    if target.exists():
+        print(f"{target} already exists", file=sys.stderr)
+        return 1
+    if not args.force:
+        demo = " ".join(scan_project(path)["demo_links"])
+        source = git(path, ["remote", "get-url", "origin"])
+    else:
+        demo, source = args.demo or "", args.source or ""
+    payload = {
+        "name": path.name,
+        "one_liner": "",
+        "problem": "",
+        "market": "",
+        # TRACKS existed and was never read anywhere -- a defined-but-dead
+        # constant is the same "not real logic" shape as everything else
+        # found here. --track is validated against it by argparse itself
+        # (choices=TRACKS), so an invalid value never reaches this file.
+        "track": args.track or "",
+        "source": source,
+        "demo": demo,
+        "status": "draft",
+        "event": "",
+    }
+    target.write_text(json.dumps(payload, indent=2) + "\n")
+    print(f"wrote {target}")
+    return 0
+
+
+def cmd_new(args):
+    """A brand-new project, from nothing to scannable -- the other half of
+    "end to end" that init alone never covered: init only ever writes a
+    manifest INTO a directory that already exists. Real, mechanical steps
+    only: a git repo, a real MIT LICENSE, a README with the project's actual
+    name in it, a hackathon.json, and a PITCH.md whose headings are the
+    judge-card's own -- nothing here fabricates content a human has to write
+    (the one-liner, the problem, the demo)."""
+    path = Path(root(args.dir)).expanduser() / args.name
+    if path.exists():
+        print(f"{path} already exists", file=sys.stderr)
+        return 1
+    path.mkdir(parents=True)
+
+    git(path, ["init", "-q"])
+
+    readme = path / "README.md"
+    readme.write_text(f"# {args.name}\n\n(one-liner goes here)\n\n"
+                       f"## problem\n\n## how it works\n\n## running it locally\n")
+
+    write_license(path)
+    write_pitch_scaffold(path, args.name)
+
+    manifest = {
+        "name": args.name,
+        "one_liner": "",
+        "problem": "",
+        "market": "",
+        "track": args.track or "",
+        "source": "",
+        "demo": "",
+        "status": "draft",
+        "event": "",
+    }
+    (path / MANIFEST).write_text(json.dumps(manifest, indent=2) + "\n")
+
+    git(path, ["add", "-A"])
+    git(path, ["commit", "-q", "-m", "hackager new: scaffold"])
+
+    print(f"new project -> {path}")
+    print("  git repo, LICENSE, README.md, docs/PITCH.md, hackathon.json -- all real files, "
+          "committed as one starting point.")
+    print("  still yours to write: the one-liner, problem, demo, and a remote to push to.")
+    return 0
+
+
+def cmd_fix(args):
+    """An EXISTING project (new or old, already on disk) toward real
+    readiness -- but only the gates this can fix mechanically, without
+    inventing content. A missing LICENSE gets a real one. A missing
+    submission doc gets the judge-card skeleton, IF nothing submission-shaped
+    already exists (never overwrites real material). A missing git repo gets
+    `git init`. Everything else -- a one-liner, a problem statement, an actual
+    deployed demo, committing whatever is dirty -- needs a human, and this
+    says so instead of faking it."""
+    path = Path(args.project).expanduser()
+    if not path.is_dir():
+        print(f"no such project: {path}", file=sys.stderr)
+        return 1
+
+    proj = scan_project(path)
+    _, steps = readiness(proj)
+    did, cant = [], []
+
+    fresh_repo = not proj["git"]
+    if not proj["git"]:
+        git(path, ["init", "-q"])
+        did.append(".git (git init)")
+
+    if not steps["license"]:
+        if write_license(path):
+            did.append("LICENSE")
+    if not steps["submission"]:
+        target = write_pitch_scaffold(path, path.name)
+        if target:
+            did.append(str(target.relative_to(path)))
+
+    if fresh_repo:
+        # Only when the repo did not exist a moment ago: everything currently
+        # untracked is either what fix() itself just wrote, or was already
+        # sitting there before any of this ran -- nothing here is a change to
+        # someone's IN-PROGRESS edit, because there was no history for an edit
+        # to be in progress against. An existing repo never gets this: its
+        # dirty state might be real uncommitted work, which is not fix()'s to
+        # commit.
+        git(path, ["add", "-A"])
+        git(path, ["commit", "-q", "-m", "hackager fix: scaffold"])
+
+    proj = scan_project(path)  # remote/dirty can only be known after the above
+
+    if not steps["readme"]:
+        cant.append("readme -- no one-liner to write for you; add one to README.md")
+    if not steps["demo"]:
+        cant.append("demo -- no URL to invent; deploy it, then it is picked up automatically")
+    if not steps["source"] and proj["git"] and not proj["remote"]:
+        cant.append("source -- git repo has no remote; `git remote add origin <url>` once pushed")
+    if proj["dirty"]:
+        cant.append(f"clean -- {proj['dirty']} uncommitted change(s); not committing on your behalf")
+
+    if did:
+        print("fixed: " + ", ".join(did))
+    if cant:
+        print("needs you: " + "; ".join(cant))
+    if not did and not cant:
+        print(f"{path.name}: already ready, nothing to fix")
+    return 0
+
+
+def cmd_check(args):
+    projects = [scan_project(p) for p in discover(root(args.dir))]
+    not_ready = [p for p in projects if readiness(p)[0] != "ready"]
+    if args.json:  # JSON only -- see cmd_doctor
+        print(json.dumps({"ready": len(projects) - len(not_ready),
+                          "not_ready": [p["name"] for p in not_ready]}, indent=2))
+        return 1 if not_ready else 0
+    if not_ready:
+        print("not submission-ready:", ", ".join(p["name"] for p in not_ready), file=sys.stderr)
+        return 1
+    print(f"all {len(projects)} projects submission-ready")
+    return 0
+
+
+PITCH_SYSTEM = ("You are the pitch coach for a hackathon submitter. Judges score the WHY before the HOW: a panel of "
+                "founders and engineers asked a finished, working entry 'tell us more about the problem' and did not "
+                "place it, because the pitch opened on the mechanism. So: produce the pitch card in EXACTLY these "
+                "markdown headings, in this order:\n\n"
+                "## <project name>  (one line under it: the thesis)\n"
+                "## The person  (one named role in one concrete scene; no product, tool or model names here)\n"
+                "## The loss  (what it costs them, with a number and its source; a 'feeling' is not a loss)\n"
+                "## Why now  (the rule, mandate, technology or price that changed)\n"
+                "## What it does  (one sentence, then how, in the person's own words)\n"
+                "## Why this is not a wrapper / chatbot / dashboard\n"
+                "## Who pays  (the buyer, not the user, if they differ)\n"
+                "## Demo (3 steps, under 2 minutes)\n\n"
+                "The first three sections must not name the product, a tool, an API, a model or a framework: they are "
+                "about the person. Each section is slide text: short lines, no coaching. THEN, after a line that is "
+                "exactly `---NOTES---`, write your candid coaching: what is thin or table-stakes, what to cut, fold or "
+                "sharpen, which number is unsourced, which judge will push back and on what. Card under 60 lines; "
+                "notes under 30. Never invent a number: if none is available, write 'NUMBER NEEDED' in the card and say "
+                "so in the notes.")
+
+
+def pitch_prompt(proj):
+    md = []
+    meta = proj["manifest"] or {}
+    if meta:
+        md.append(f"# hackathon.json ({proj['name']})")
+        md.append(json.dumps(meta, indent=2))
+
+    readme = Path(proj["path"]) / "README.md"
+    if readme.is_file():
+        text = "\n".join(readme.read_text(errors="replace").split("\n")[:40])
+        md.append("# README.md (first 40 lines)")
+        md.append(text)
+
+    # Not README.md + one literal SUBMISSION.md: every real submission-shaped
+    # doc this project actually has, whatever it's named -- PITCH.md,
+    # DEMO.md, DEPLOY.md, RUNBOOK.md, DEVNET_PROOF.md, SCAFFOLD.md all count.
+    # The old version fed the LLM nothing but a README for 5 of 6 real
+    # projects here, because none of them happen to have a SUBMISSION.md.
+    for f in proj.get("submission_docs") or []:
+        f = Path(f)
+        if f.is_file():
+            text = "\n".join(f.read_text(errors="replace").split("\n")[:60])
+            md.append(f"# {f.name} (first 60 lines)")
+            md.append(text)
+
+    jf = Path(proj["path"]) / "docs" / "reference" / "judges.json"
+    if jf.is_file():
+        md.append("# The judging panel (write the card for these people; name no judge in the card itself)")
+        md.append(jf.read_text(errors="replace"))
+    return PITCH_SYSTEM + "\n\n---\n\n" + "\n\n".join(md)
+
+
+DOC_ONLY = ("You have no tools and cannot create files. The caller saves your reply to the "
+            "file named in the request. Reply with the finished document only -- no preface, "
+            "no questions, no offer to do more.")
+
+DEFAULT_LLM_MODEL = "sonnet"  # claude's own alias for the latest Sonnet; resolved
+                              # and confirmed against a real call: canonicalModel
+                              # came back "claude-sonnet-5".
+
+
+def run_llm(prompt, cwd, model=None, timeout=300):
+    """The one place that actually calls an LLM. `pitch` and `learn` both go
+    through this -- "hackager is also an LLM wrapper" means one real wrapper
+    both commands share, not two copies of logic that could quietly drift
+    apart. Headless via the `claude` CLI itself (already authenticated on this
+    machine, unlike opencode here, which had zero provider credentials
+    configured -- `opencode models` listed 7 free-tier community models and
+    nothing from Anthropic at all). One JSON object back, not an event
+    stream. Returns (ok, result_text, cost_usd, raw_json)."""
+    # --tools "" and --strict-mcp-config: this is a document generator. The
+    # first `brief` run proved the need -- Sonnet read "write docs/BRIEF.md",
+    # reached for a file tool, and replied "I need write permission approved"
+    # -- and, checked separately, a bare `claude -p` here still carries the
+    # user's claude.ai MCP connectors (it named Gmail). Neither belongs in a
+    # pitch or rules call.
+    res = subprocess.run(
+        ["claude", "-p", "--model", model or DEFAULT_LLM_MODEL,
+         "--output-format", "json", "--tools", "", "--strict-mcp-config",
+         "--append-system-prompt", DOC_ONLY, prompt],
+        capture_output=True, text=True, timeout=timeout, cwd=str(cwd),
+    )
+    try:
+        obj = json.loads(res.stdout)
+    except json.JSONDecodeError:
+        return False, res.stderr.strip() or "claude produced no parseable output", 0.0, res.stdout
+    ok = res.returncode == 0 and not obj.get("is_error")
+    return ok, obj.get("result", ""), obj.get("total_cost_usd", 0.0), res.stdout
+
+
+BUILD_LLM_MODEL = "opus"  # a long unattended coding run; sonnet stays the default elsewhere
+
+
+def run_llm_agent(prompt, cwd, model, timeout, budget, max_turns):
+    """Like run_llm, but the model may edit files and run commands in `cwd`,
+    and progress is printed as it happens -- a 20-minute silent run reads as
+    a hang. stream-json (checked against a real call): `assistant` events
+    carry text/tool_use blocks, the final `result` carries total_cost_usd,
+    num_turns, is_error. Permissions: acceptEdits plus an explicit tool
+    allowlist, so nothing ever waits on a prompt headless mode cannot answer;
+    no --add-dir, so file tools stay inside cwd. Budget and turn caps are
+    passed to claude itself, not just checked afterwards."""
+    cmd = ["claude", "-p", "--model", model, "--output-format", "stream-json", "--verbose",
+           "--strict-mcp-config", "--permission-mode", "acceptEdits",
+           "--allowedTools", "Read", "Edit", "Write", "Bash", "Glob", "Grep",
+           "--max-budget-usd", str(budget), "--max-turns", str(max_turns), prompt]
+    raw, result = [], None
+    proc = subprocess.Popen(cmd, cwd=str(cwd), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True)
+    try:
+        for line in proc.stdout:
+            raw.append(line)
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("type") == "assistant":
+                for block in ev.get("message", {}).get("content", []):
+                    if block.get("type") == "text" and block.get("text", "").strip():
+                        print(block["text"].strip()[:600], flush=True)
+                    elif block.get("type") == "tool_use":
+                        inp = block.get("input", {})
+                        what = inp.get("command") or inp.get("file_path") or inp.get("pattern") or ""
+                        print(f"  [{block.get('name')}] {str(what)[:110]}", flush=True)
+            elif ev.get("type") == "result":
+                result = ev
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return False, f"timed out after {timeout}s", 0.0, "".join(raw)
+    if result is None:
+        return False, proc.stderr.read().strip() or "claude produced no result event", 0.0, "".join(raw)
+    ok = proc.returncode == 0 and not result.get("is_error")
+    return ok, result.get("result", ""), result.get("total_cost_usd", 0.0), "".join(raw)
+
+
+def confirm(summary, model, cost=None, llm=True):
+    """A real prompt, not a --run flag to remember. This calls a paid API --
+    a trivial two-word test call during development still cost $0.05, mostly
+    context setup -- so "no need for dry-run" does not mean "no gate", it
+    means the gate is here instead of a flag you had to already know about.
+
+    llm=False for the outward-facing ones (deploy, publish): they spend
+    nothing on a model, and printing "model: sonnet" over a `wrangler deploy`
+    was simply untrue."""
+    print(summary + (f"\nmodel: {model or DEFAULT_LLM_MODEL}" if llm else "")
+          + (f"\n{cost}" if cost else ""))
+    try:
+        return input("proceed? [y/N] ").strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
+# Not "how it was hosted" -- keywords that show up when a commit is about
+# getting the thing DEPLOYED/scheduled/running somewhere, not about what it
+# does. Tested against XYZ's real log before use: matches exactly the 2 of 36
+# commits that are actually about Trigger.dev/cron/secrets, none of the other
+# 34 that are architecture, UI, or docs.
+DEPLOY_RE = re.compile(
+    r"deploy|hosting|wrangler|docker|render\.com|vercel|fly\.io|ci/cd|"
+    r"release:|publish|trigger\.dev|cron|secrets? sync|worker becomes|scheduled sweep",
+    re.I,
+)
+
+
+def git_commits(path, exclude_deploy=True):
+    """Every commit as (unix_ts, subject), oldest first. Deployment-shaped
+    ones dropped by default -- this is about how the THING got built, not how
+    it got hosted."""
+    raw = git(path, ["log", "--format=%at|%s", "--reverse"])
+    out = []
+    for line in raw.splitlines():
+        if "|" not in line:
+            continue
+        ts, subject = line.split("|", 1)
+        if exclude_deploy and DEPLOY_RE.search(subject):
+            continue
+        try:
+            out.append((int(ts), subject))
+        except ValueError:
+            continue
+    return out
+
+
+def dev_sessions(commits, gap_minutes=90):
+    """Group commits into work sessions -- a session ends when the gap to the
+    next commit exceeds gap_minutes. A hackathon project built in one sitting
+    shows as one session; one built over weeks shows as many, which is itself
+    real signal about how it was made."""
+    if not commits:
+        return []
+    sessions = [[commits[0]]]
+    for prev, cur in zip(commits, commits[1:]):
+        gap = (cur[0] - prev[0]) / 60
+        if gap > gap_minutes:
+            sessions.append([])
+        sessions[-1].append(cur)
+    return sessions
+
+
+LEARN_SYSTEM = ("You are studying how a hackathon project was actually built, from its own "
+                 "git history -- not how it was deployed or hosted, that is deliberately "
+                 "excluded already. Given the commit timeline below (grouped into work "
+                 "sessions by time gap), write a candid narrative covering: what got built "
+                 "first and why that ordering makes sense (or doesn't), how the work was "
+                 "paced (one sprint vs. spread out, and what that implies), where the effort "
+                 "concentrated, and one or two lessons a team building something similar "
+                 "under the same time pressure should take from this. Under 50 lines. Do "
+                 "not invent facts not in the log -- if something is unclear from the "
+                 "commits alone, say so instead of guessing.")
+
+
+def learn_prompt(proj):
+    path = Path(proj["path"])
+    commits = git_commits(path)
+    sessions = dev_sessions(commits)
+    md = [f"# {proj['name']} -- {len(commits)} commits (deployment-related ones excluded), "
+          f"{len(sessions)} work session(s)"]
+    for i, sess in enumerate(sessions, 1):
+        start = datetime.fromtimestamp(sess[0][0]).strftime("%Y-%m-%d %H:%M")
+        end = datetime.fromtimestamp(sess[-1][0]).strftime("%H:%M")
+        md.append(f"\n## session {i}: {start} -> {end} ({len(sess)} commits)")
+        for ts, subject in sess:
+            md.append(f"- {subject}")
+    return LEARN_SYSTEM + "\n\n---\n\n" + "\n".join(md)
+
+
+def cmd_learn(args):
+    project = Path(args.project).expanduser()
+    proj = scan_project(project)
+    INTERNALS.mkdir(exist_ok=True)
+    prompt_file = INTERNALS / f"{proj['name']}-learn.txt"
+    prompt_file.write_text(learn_prompt(proj))
+    out = project_docs(proj) / "INSIGHTS.md"
+    if not args.yes and not confirm(f"learn: read {proj['name']}'s git history (deployment "
+                                     f"excluded) and write {out}", args.model):
+        print("cancelled")
+        return 2
+    ok, text, cost, raw = run_llm(prompt_file.read_text(), project, args.model, args.timeout)
+    (INTERNALS / f"{proj['name']}-learn.raw.jsonl").write_text(raw)
+    out.write_text(text)
+    print(text[:4000])
+    print(f"\n-> {out}")
+    print(f"\n-- cost: ${cost:.4f}")
+    return 0 if ok else 1
+
+
+def cmd_pitch(args):
+    project = Path(args.project).expanduser()
+    proj = scan_project(project)
+    INTERNALS.mkdir(exist_ok=True)
+    prompt_file = INTERNALS / f"{proj['name']}-pitch.txt"
+    prompt_file.write_text(pitch_prompt(proj))
+    docs = project_docs(proj)
+    # Write over docs/PITCH.md only while it is still the blank skeleton.
+    # Once someone has filled it in (TenTen's was hand-refined and committed),
+    # a fresh LLM draft goes BESIDE it, never over it -- the human merges.
+    target = docs / "PITCH.md"
+    if target.is_file() and not is_scaffold(target):
+        target = docs / "PITCH.draft.md"
+    if not args.yes and not confirm(f"pitch: draft a judge card for {proj['name']} and write "
+                                     f"{target}", args.model):
+        print("cancelled")
+        return 2
+    ok, text, cost, raw = run_llm(prompt_file.read_text(), project, args.model, args.timeout)
+    (INTERNALS / f"{proj['name']}-pitch.raw.jsonl").write_text(raw)
+    # The card and the coaching are two documents. `slides` makes one slide
+    # per `##`, so coaching inside PITCH.md ends up on a slide -- it did,
+    # until a human noticed. The notes go beside the card, never in it.
+    card, _, notes = text.partition("---NOTES---")
+    card, notes = card.strip() + "\n", notes.strip() + "\n"
+    target.write_text(card)
+    notes_path = docs / "PITCH.notes.md"
+    if notes.strip():
+        notes_path.write_text("# Pitch coaching (not slide text)\n\n" + notes)
+    verdict = pitch_problem_first(target)
+    print(card[:4000])
+    print(f"\n-> {target}" + ("  (existing PITCH.md left untouched -- merge by hand)"
+                              if target.name == "PITCH.draft.md" else ""))
+    if notes.strip():
+        print(f"-> {notes_path}  (coaching, kept out of the deck)")
+    if verdict:
+        print(f"note: {verdict}", file=sys.stderr)
+    print(f"\n-- cost: ${cost:.4f}")
+    return 0 if ok else 1
+
+
+VENV_PY = SELF.parent / ".venv" / "bin" / "python3"
+
+
+def need_venv():
+    if not VENV_PY.exists():
+        print(f"missing {VENV_PY} -- run: python3 -m venv .venv && "
+              f".venv/bin/pip install weasyprint python-pptx", file=sys.stderr)
+        return False
+    return True
+
+
+def cmd_slides(args):
+    """Real slides, from a real pitch card -- python-pptx via a dedicated
+    venv (hackathon-manager/.venv), not the system interpreter: pip refused
+    to touch system Python here (PEP 668), correctly. Not the PowerPoint MCP
+    server either -- that speaks MCP over stdio to an MCP-aware host, which
+    hackager is not; it is built on python-pptx, so python-pptx is what is
+    actually used, directly."""
+    if not need_venv():
+        return 1
+    proj = scan_project(Path(args.project).expanduser())
+    card = pitch_card(proj)
+    if card is None or is_scaffold(card):
+        print(f"no filled-in pitch doc in {proj['name']}/docs -- write docs/PITCH.md or run "
+              f"`hackager pitch {proj['name']}` first", file=sys.stderr)
+        return 1
+    complaint = pitch_problem_first(card)
+    if complaint:
+        print(f"note: {complaint}", file=sys.stderr)
+    out = project_docs(proj) / f"{proj['name']}.pptx"
+    res = subprocess.run([str(VENV_PY), str(SELF.parent / "lib" / "build_slides.py"),
+                          proj["name"], str(card), str(out)],
+                         capture_output=True, text=True)
+    if res.returncode != 0:
+        print(res.stderr.strip(), file=sys.stderr)
+        return 1
+    print(res.stdout.strip())
+    # Free and deterministic -- no LLM, no confirmation needed. Runs every
+    # time so a dense/inconsistent deck never ships unnoticed.
+    rev = subprocess.run([str(VENV_PY), str(SELF.parent / "lib" / "review_slides.py"), str(out)],
+                         capture_output=True, text=True)
+    if rev.returncode == 0:
+        report = json.loads(rev.stdout)
+        if report["dense"]:
+            print("dense slides (>60 words -- consider splitting):")
+            for d in report["dense"]:
+                print(f"  slide {d['slide']} ({d['words']} words): {d['title']}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# demo: the video. Until now this was the one artifact the tool told you to
+# go and make yourself. The pattern is lifted from Xendit/docs, which does it
+# properly: a VHS tape (charmbracelet/vhs) drives real project commands in a
+# headless terminal and encodes the frames, so re-rendering cannot drift away
+# from what the code does -- unlike a screen capture of someone typing, which
+# has to be re-shot by hand every time the code changes. Its media/README puts
+# the rule plainly: "The tape is re-rendered rather than edited, so the
+# recording cannot drift away from what the code actually does."
+
+# A terminal recording only *is* the demo when the project runs in a terminal.
+# The Amazon rules want "footage that shows the Project functioning on the
+# device for which it was built" -- for a Fire TV or Ring entry a asciicast of
+# npm test is not that, and shipping one would fail the requirement while
+# looking finished.
+DEVICE_RE = re.compile(r"fire\s?tv|vega\s?os|fire\s?os|\bring\b|alexa\+? device|apple watch|"
+                       r"android|ios\b|mobile app|react native|browser extension", re.I)
+
+
+def looks_terminal_demoable(proj):
+    """(ok, reason). Honest about the cases where a tape is the wrong medium."""
+    path = Path(proj["path"])
+    hay = " ".join([read_if(path / "README.md", 8000),
+                    json.dumps(proj["manifest"] or {}),
+                    read_if(path / "docs" / "RULES.md", 4000)])
+    hit = DEVICE_RE.search(hay)
+    if hit:
+        return False, (f"this project mentions {hit.group(0)!r} -- if the rules ask for footage of "
+                       f"it running on that device, a terminal recording does not satisfy them")
+    return True, ""
+
+
+TAPE_SYSTEM = (
+    "You write VHS tapes (charmbracelet/vhs) that record a terminal demo of a project. "
+    "Output ONLY the tape, no fences, no commentary.\n"
+    "Syntax you may use: comments with #; `Output <path>`; `Set Shell zsh|bash`, `Set FontSize`, "
+    "`Set Width`, `Set Height`, `Set Padding`, `Set Theme`, `Set TypingSpeed`, `Set PlaybackSpeed`; "
+    "`Type \"...\"`; `Enter`; `Sleep <n>s`; `Hide`/`Show`; `Ctrl+<key>`.\n"
+    "Hard rules:\n"
+    "- Start with exactly these two output lines: `Output docs/media/demo.gif` and "
+    "`Output docs/media/demo.mp4`.\n"
+    "- Then: Set Shell zsh / FontSize 15 / Width 1200 / Height 800 / Padding 20 / "
+    "Theme \"Catppuccin Mocha\" / TypingSpeed 40ms.\n"
+    "- Open with a Hide / Type \"setopt interactive_comments 2>/dev/null; clear\" / Enter / Sleep 1s / Show "
+    "block: zsh does not accept # comments interactively, so without it every comment line you Type prints "
+    "'command not found' into the recording (it did; the contact sheet caught it), and the first frame is clean.\n"
+    "- ONLY run commands that demonstrably exist in the project below (its package.json scripts, "
+    "Makefile targets, or the README's own Run section). Never invent a command or a flag. If a "
+    "build step is needed first, run it inside a Hide/Show block so the video is not 40 seconds "
+    "of compiler output.\n"
+    "- The tape is run from the project root, non-interactively, with no human at the keyboard: "
+    "nothing that waits for input, no editors, no servers left in the foreground without a way "
+    "to move past them.\n"
+    "- Sleep long enough for each command to actually FINISH -- a truncated frame is worse than a "
+    "slow one. Total runtime under 3 minutes (a hard submission limit on most platforms).\n"
+    "- Comment each step with what a judge is meant to see, in the tape itself.\n"
+    "- Structure it as an argument: the problem state, the thing happening, the proof it persisted "
+    "or was enforced. Lead with whatever the project's own docs say is the point.")
+
+
+def tape_prompt(proj):
+    path = Path(proj["path"])
+    pkg = {}
+    if (path / "package.json").is_file():
+        try:
+            pkg = json.loads((path / "package.json").read_text()).get("scripts", {})
+        except (OSError, json.JSONDecodeError):
+            pkg = {}
+    v = last_verify(proj) or {}
+    return (TAPE_SYSTEM
+            + "\n\n===== hackathon.json\n" + json.dumps(proj["manifest"], indent=2)
+            + "\n\n===== package.json scripts (these exist; anything else probably does not)\n"
+            + json.dumps(pkg, indent=2)
+            + "\n\n===== verify: commands that were actually run and passed\n"
+            + json.dumps(v.get("runs", []), indent=2)
+            + "\n\n===== README.md\n" + read_if(path / "README.md", 20000)
+            + "\n\n===== docs/PITCH.md (what the demo has to prove)\n"
+            + read_if(path / "docs" / "PITCH.md", 8000)
+            + "\n\n===== files\n" + clip(git(path, ["ls-files"]), 4000))
+
+
+def tape_timeline(tape_text):
+    """Cumulative timings from the tape's own Sleep/Type/TypingSpeed values --
+    arithmetic, not an LLM guess, so the narration's cue times match the file
+    that actually gets rendered."""
+    speed_ms, t, rows, started = 50.0, 0.0, [], False
+    for line in tape_text.splitlines():
+        s = line.strip()
+        if m := re.match(r"Set\s+TypingSpeed\s+(\d+(?:\.\d+)?)(ms|s)\b", s):
+            speed_ms = float(m[1]) * (1000 if m[2] == "s" else 1)
+        elif m := re.match(r"Sleep\s+(\d+(?:\.\d+)?)(ms|s)\b", s):
+            t += float(m[1]) * (1 if m[2] == "s" else 0.001)
+        elif m := re.match(r'Type\s+"(.*)"\s*$', s):
+            t += len(m[1]) * speed_ms / 1000.0
+            started = True
+            rows.append((t, m[1]))
+        elif started and s.startswith("#") and len(s.strip("# -")) > 2:
+            # Only comments BETWEEN steps are cues. Every tape opens with a
+            # header block explaining itself; those landed as 0:00 cues and
+            # would have been narrated as if they were on screen.
+            rows.append((t, s.strip("# -").strip()))
+    return t, rows
+
+
+def cmd_demo(args):
+    """Write the tape if there isn't one (LLM, grounded in the project's real
+    commands), then render it. Rendering is free and deterministic; it runs
+    the project's own commands, same as `verify`."""
+    proj = scan_project(Path(args.project).expanduser())
+    path = Path(proj["path"])
+    if not shutil.which("vhs"):
+        print("vhs not installed -- brew install vhs (needs ffmpeg + ttyd)", file=sys.stderr)
+        return 1
+    tape = path / "docs" / "demo.tape"
+    if not tape.is_file():
+        ok, why = looks_terminal_demoable(proj)
+        if not ok:
+            print(f"warning: {why}", file=sys.stderr)
+            print("         a tape is still useful as a supporting clip -- but do not submit it "
+                  "as THE demo unless the rules allow one.", file=sys.stderr)
+        # A tape is not a markdown doc, so it gets its own shape check: the
+        # two Output lines and at least one real keystroke.
+        rc = llm_to_file(args, proj, "tape", tape_prompt(proj), tape,
+                         f"demo: write a VHS tape for {proj['name']} -> {tape}",
+                         validate=lambda t: ("Output docs/media/demo.mp4" in t
+                                             and "Output docs/media/demo.gif" in t
+                                             and "interactive_comments" in t
+                                             and re.search(r'^\s*Type\s+"', t, re.M)))
+        if rc != 0:
+            return rc
+    if args.write_only:
+        return 0
+    media = path / "docs" / "media"
+    media.mkdir(parents=True, exist_ok=True)
+    # The tape is source and is tracked; the render is output and is not.
+    # Xendit's own media/README states the rule this follows -- "the recording
+    # is generated, not committed by hand" -- and it keeps a few MB of gif out
+    # of a repo a judge has to clone. The video goes to YouTube, not to git.
+    gi = media / ".gitignore"
+    if not gi.is_file():
+        gi.write_text("# Generated by `hackager demo`. Re-render with `vhs docs/demo.tape`;\n"
+                      "# never edit the recording by hand, or it drifts from the code.\n"
+                      "# .jpg covers demo-contact.jpg, the frame grid -- also generated.\n"
+                      "*.gif\n*.mp4\n*.webm\n*.png\n*.jpg\n*.jpeg\n")
+    total, _ = tape_timeline(tape.read_text())
+    print(f"rendering {tape.relative_to(path)} (~{total:.0f}s of tape, real commands) ...")
+    if total > 180:
+        print(f"warning: {total:.0f}s exceeds the 3-minute limit most platforms impose",
+              file=sys.stderr)
+    res = subprocess.run(["vhs", str(tape.relative_to(path))], cwd=str(path),
+                         capture_output=True, text=True, timeout=args.render_timeout)
+    if res.returncode != 0:
+        print((res.stderr or res.stdout).strip()[-2000:], file=sys.stderr)
+        return 1
+    made = sorted(f for f in media.glob("demo.*") if f.suffix in (".gif", ".mp4"))
+    for f in made:
+        print(f"  {f.stat().st_size:>9} bytes  {f.relative_to(path)}")
+    if not made:
+        print("vhs reported success but produced no files", file=sys.stderr)
+        return 1
+    mp4 = media / "demo.mp4"
+    if mp4.is_file() and shutil.which("ffprobe"):
+        sheet, stamps = contact_sheet(mp4, media / "demo-contact.jpg")
+        if sheet:
+            print(f"\n  {sheet.relative_to(path)} -- {len(stamps)} frames, left to right, top to "
+                  f"bottom:")
+            print("   " + "  ".join(f"{i}:{int(t // 60)}m{int(t % 60):02d}"
+                                    for i, t in enumerate(stamps, 1)))
+    print("\nCHECK THE FOOTAGE BEFORE SUBMITTING -- a tape that recorded an error renders just as\n"
+          "happily as one that worked. Open demo.mp4, or read demo-contact.jpg (that is what it\n"
+          "is for: a vision model can look at the tiles and say which one shows a failure).")
+    return 0
+
+
+# Lifted from umcares/inspect.py, whose docstring states the point better than
+# a summary would: contact sheets exist "so a vision-capable model can literally
+# look at the footage". `demo` used to end by telling you to watch the video --
+# an instruction an LLM driving this tool cannot follow, which quietly broke the
+# whole "any LLM can drive hackager alone" claim at the last step.
+
+def contact_sheet(video, out, tiles=9, cols=3, width=480):
+    """Tile N frames sampled evenly across the video into one image.
+    Returns the timestamps, in tile order, so a reader can map "tile 5" back
+    to a moment and say what is wrong with it."""
+    dur = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                          "-of", "csv=p=0", str(video)], capture_output=True, text=True)
+    try:
+        total = float(dur.stdout.strip())
+    except ValueError:
+        return None, []
+    # Skip the first and last 3%: tapes open on a clear and close on a prompt.
+    stamps = [total * (0.03 + 0.94 * i / max(tiles - 1, 1)) for i in range(tiles)]
+    with tempfile.TemporaryDirectory() as tmp:
+        for i, ts in enumerate(stamps, 1):
+            subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{ts:.2f}",
+                            "-i", str(video), "-frames:v", "1", "-vf", f"scale={width}:-2",
+                            "-q:v", "5", f"{tmp}/{i:03d}.jpg"], capture_output=True)
+        rows = (tiles + cols - 1) // cols
+        res = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-pattern_type", "glob",
+                              "-i", f"{tmp}/*.jpg", "-filter_complex", f"tile={cols}x{rows}",
+                              "-frames:v", "1", "-update", "1", "-q:v", "6", str(out)],
+                             capture_output=True, text=True)
+    if res.returncode != 0 or not out.is_file():
+        return None, []
+    return out, stamps
+
+
+NARRATE_SYSTEM = (
+    "You write the spoken narration for a hackathon demo video. You are given the VHS tape that "
+    "produced the footage and its real cue times, computed from the tape's own Sleep and "
+    "TypingSpeed values. Output markdown: a `## Shot list` table (| Time | On screen | Say |) "
+    "using ONLY the given cue times -- do not invent timings -- then `## Script` with the words to "
+    "read, at roughly 140 words per minute, fitting inside the total runtime. Say what is on "
+    "screen; never describe a feature the tape does not show. End with one line naming the single "
+    "moment the whole argument rests on. Under 80 lines.")
+
+
+def cmd_narrate(args):
+    proj = scan_project(Path(args.project).expanduser())
+    path = Path(proj["path"])
+    tape = path / "docs" / "demo.tape"
+    if not tape.is_file():
+        print(f"no docs/demo.tape -- `hackager demo {path}` first", file=sys.stderr)
+        return 1
+    total, rows = tape_timeline(tape.read_text())
+    cues = "\n".join(f"{int(t // 60)}:{int(t % 60):02d}  {what}" for t, what in rows)
+    out = project_docs(proj) / "NARRATION.md"
+    prompt = (NARRATE_SYSTEM + f"\n\n===== total runtime: {total:.0f}s\n\n===== cue times\n{cues}"
+              + "\n\n===== the tape\n" + tape.read_text()
+              + "\n\n===== docs/PITCH.md\n" + read_if(path / "docs" / "PITCH.md", 8000))
+    return llm_to_file(args, proj, "narrate", prompt, out,
+                       f"narrate: script the {total:.0f}s demo -> {out}",
+                       headings=("## Shot list", "## Script"))
+
+
+def cmd_pdf(args):
+    """A REAL, generic markdown -> PDF, not generate-pdfs.sh copied over: that
+    script hardcoded one client's file list and an absolute /workspace/pdf.css
+    path meaningful only inside their own Docker image. What is reused is the
+    actual mechanism -- pandoc with weasyprint as the PDF engine -- pointed at
+    whatever file you give it."""
+    if not need_venv():
+        return 1
+    src = Path(args.target).expanduser()
+    if src.is_dir():
+        # A project: its pitch doc, so the panel can say `pdf <project>` and
+        # the PDF lands beside the markdown, inside the project.
+        proj = scan_project(src)
+        card = pitch_card(proj)
+        if card is None or is_scaffold(card):
+            print(f"no filled-in pitch doc in {proj['name']}/docs to render", file=sys.stderr)
+            return 1
+        src = card
+    if not src.is_file():
+        print(f"no such file: {src}", file=sys.stderr)
+        return 1
+    if args.slides:
+        # The form said "presentation slides, PDF format"; `slides` makes a pptx and
+        # there was no LibreOffice to convert it. One 16:9 page per `##`, images,
+        # `::stamp WORD` and `::cat mood` directives, rendered by weasyprint directly.
+        out = Path(args.out).expanduser() if args.out else src.parent / f"{src.parent.parent.name}-slides.pdf"
+        res = subprocess.run([str(VENV_PY), str(SELF.parent / "lib" / "slides_pdf.py"), str(src), str(out)],
+                             capture_output=True, text=True)
+        print((res.stdout or res.stderr).strip())
+        return 0 if res.returncode == 0 else 1
+    out = Path(args.out).expanduser() if args.out else src.with_suffix(".pdf")
+    weasyprint = SELF.parent / ".venv" / "bin" / "weasyprint"
+    res = subprocess.run(["pandoc", "--pdf-engine", str(weasyprint), "-f", "markdown",
+                          str(src), "-o", str(out)], capture_output=True, text=True)
+    if res.returncode != 0:
+        print(res.stderr.strip(), file=sys.stderr)
+        return 1
+    print(f"{out}")
+    return 0
+
+
+def fetch_url(url, timeout=15):
+    """Stdlib only -- no FETCH'EM. That project is a Docker/Celery scraping
+    service built for adversarial targets: proxy rotation, CAPTCHA solving,
+    residential proxies, honeypot detection, none of it configured with
+    credentials here, and none of it needed to read a public university
+    hackathon page. Pulling in celery+redis+playwright+cloudscraper for a
+    plain GET would be pretending to a capability this has no way to
+    exercise. A real User-Agent (the same one FETCH'EM's own WebFetcher
+    sends) is the one thing worth carrying over."""
+    import urllib.request
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.status, r.read().decode(errors="replace")
+
+
+def meta_text(s):
+    """title + description/og/keywords meta. On a client-rendered SPA this is
+    often the ONLY prose in the served HTML -- the Averis x Monash site is a
+    single JS bundle whose 40KB of markup yielded 62 characters of body text,
+    while its meta tags carried the theme, the team size and the eligibility.
+    Thrown away before; it is the only thing a plain GET can see there."""
+    out = []
+    if m := re.search(r"<title[^>]*>(.*?)</title>", s, re.S | re.I):
+        out.append(html_mod.unescape(re.sub(r"\s+", " ", m[1])).strip())
+    for tag in re.findall(r"<meta\s+[^>]*>", s, re.I):
+        name = re.search(r'(?:name|property)\s*=\s*["\']([^"\']+)', tag, re.I)
+        content = re.search(r'content\s*=\s*["\']([^"\']*)', tag, re.I)
+        if not name or not content or not content[1].strip():
+            continue
+        if re.search(r"description|keywords|^og:|^twitter:", name[1], re.I):
+            val = html_mod.unescape(content[1]).strip()
+            line = f"{name[1]}: {val}"
+            if line not in out:
+                out.append(line)
+    return "\n".join(out)
+
+
+def html_to_text(s):
+    """Visible text only, stdlib. Every page this has been pointed at so far
+    (Sime Darby, Devpost) was server-rendered, so this is what a reader sees;
+    a client-rendered SPA comes out near-empty, which is itself the signal --
+    so the meta block goes in front, and cmd_fetch says when that is all
+    there was."""
+    head = meta_text(s)
+    s = re.sub(r"<(script|style|noscript|svg)[^>]*>.*?</\1>", " ", s, flags=re.S | re.I)
+    s = re.sub(r"<br\s*/?>|</(p|div|li|h\d|tr|section|article|header|footer)>", "\n", s, flags=re.I)
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = html_mod.unescape(s)
+    lines = [re.sub(r"[ \t]+", " ", l).strip() for l in s.splitlines()]
+    body = "\n".join(l for l in lines if l)
+    return (head + "\n\n" + body).strip() if head else body
+
+
+# The pages behind a hackathon site's buttons -- rules, terms, dates, FAQ --
+# are where the requirements actually live; the landing page is marketing.
+# Both real runs (Sime Darby: /register + /terms-and-conditions; Devpost:
+# /rules + /details/dates + /resources) needed them, and both times the
+# links had to be grepped out of the HTML by hand.
+FOLLOW_RE = re.compile(r"rules|terms|conditions|dates|schedule|timeline|resources|faq|"
+                       r"prizes|judg|criteria|submission|register|eligib|requirement|"
+                       r"guideline|brief|challenge", re.I)
+
+
+def linked_pages(base_url, body, limit=12):
+    from urllib.parse import urljoin, urlsplit, urlunsplit
+    base = urlsplit(base_url)
+    seen, out = {urlunsplit(base._replace(query="", fragment="")).rstrip("/")}, []
+    for href in re.findall(r'href=["\']([^"\'#]+)', body):
+        u = urlsplit(urljoin(base_url, html_mod.unescape(href)))
+        if u.netloc != base.netloc or not FOLLOW_RE.search(u.path):
+            continue
+        clean = urlunsplit(u._replace(query="", fragment="")).rstrip("/")
+        if clean in seen or re.search(r"\.(css|js|png|jpg|svg|ico|pdf)$", clean, re.I):
+            continue
+        seen.add(clean)
+        out.append(clean)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def save_page(proj, url, timeout):
+    status, body = fetch_url(url, timeout)
+    # Raw page under the project it is evidence for -- a hackathon's own
+    # rules/terms belong with the entry being prepared for it, not in a
+    # shared fetched/ bucket under the manager where nothing can cite it.
+    fetched = project_docs(proj) / "reference"
+    fetched.mkdir(exist_ok=True)
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", url.split("//", 1)[-1])[:80]
+    out = fetched / f"{name}.html"
+    out.write_text(body)
+    # A .txt beside it so the next reader -- `hackager read`, `rules`, or an
+    # LLM confined to this tool -- never has to strip HTML itself.
+    text = html_to_text(body)
+    out.with_suffix(".txt").write_text(text)
+    # out.stat().st_size, not len(body): body is decoded text, a character
+    # count, and multi-byte characters made it undercount the real file.
+    print(f"{status} {out.stat().st_size} bytes -> {out}")
+    # A near-empty extraction from a large page is a client-rendered site, and
+    # saying nothing about it is the dangerous case: `rules` would go on to
+    # distil a blank page into a confident-looking document.
+    if len(body) > 4000 and len(text) < len(body) * 0.05:
+        print(f"  warning: only {len(text)} chars of text from {len(body)} of HTML -- this page "
+              f"renders its content in JavaScript.\n"
+              f"  a plain GET cannot see it. Save the page from a browser into "
+              f"{out.parent}/ as .txt, or paste the rules there by hand.", file=sys.stderr)
+    return body
+
+
+def cmd_fetch(args):
+    proj = scan_project(Path(args.project).expanduser())
+    try:
+        body = save_page(proj, args.url, args.timeout)
+    except Exception as e:
+        print(f"fetch failed: {e}", file=sys.stderr)
+        return 1
+    if args.follow:
+        links = linked_pages(args.url, body)
+        print(f"following {len(links)} linked page(s) on the same site:")
+        for u in links:
+            try:
+                save_page(proj, u, args.timeout)
+            except Exception as e:
+                print(f"  {u}: {e}", file=sys.stderr)
+    return 0
+
+
+# Data, not documentation. A downloaded challenge bundle carries both, and
+# feeding 60 sample emails to `rules` would cost real money to learn nothing.
+BUNDLE_DATA_DIRS = {"attachments", "inbox", "data", "samples", "node_modules", "__pycache__"}
+
+
+def reference_pages(proj):
+    """Everything under docs/reference that DESCRIBES the challenge: fetched
+    pages, plus any README/markdown inside a bundle downloaded by hand.
+
+    The bundle half was missing: the Averis problem statement arrived as a zip
+    whose README.md is the actual brief, one directory down, and `rules` could
+    not see it -- so a project with the real spec on disk still distilled the
+    landing page's SEO tags. Backfills .txt for any .html saved before .txt
+    existed."""
+    ref = Path(proj["path"]) / "docs" / "reference"
+    if not ref.is_dir():
+        return []
+    for h in ref.glob("*.html"):
+        t = h.with_suffix(".txt")
+        if not t.is_file():
+            t.write_text(html_to_text(h.read_text(errors="replace")))
+    # The brief arrives as screenshots and PDFs as often as pages: Hackerdorm's came as
+    # WhatsApp images of slides, read by hand into a .txt at the time. Convert what can be
+    # converted, once, beside the original; what cannot is named so the human knows.
+    for f in list(ref.glob("*.pdf")):
+        t = f.with_suffix(".pdf.txt")
+        if not t.is_file() and shutil.which("pdftotext"):
+            subprocess.run(["pdftotext", "-layout", str(f), str(t)], capture_output=True)
+    for f in [x for ext in ("png", "jpg", "jpeg", "webp", "tif", "tiff") for x in ref.glob(f"*.{ext}")]:
+        t = f.with_suffix(f.suffix + ".txt")
+        if not t.is_file() and shutil.which("tesseract"):
+            subprocess.run(["tesseract", str(f), str(t.with_suffix("")), "--psm", "6"], capture_output=True)
+    out = list(ref.glob("*.txt")) + list(ref.glob("*.md"))
+    for f in ref.rglob("*.md"):
+        if f.parent != ref and not (BUNDLE_DATA_DIRS & set(p.name.lower() for p in f.parents)):
+            out.append(f)
+    return sorted(set(out))
+
+
+def readable_pages(proj):
+    """Everything in this project an agent may need to READ: the docs hackager
+    itself wrote, plus the fetched pages.
+
+    The docs half was missing, and `next` was the thing that exposed it -- it
+    says "docs/BRIEF.md has a ## Manifest block to take them from" while
+    `read` served only docs/reference/*.txt, so an agent confined to this tool
+    could not follow the tool's own instruction. Anything hackager tells you
+    to read, it has to be able to show you."""
+    docs = Path(proj["path"]) / "docs"
+    out = sorted(docs.glob("*.md")) if docs.is_dir() else []
+    return out + reference_pages(proj)
+
+
+def cmd_read(args):
+    """Print one of this project's docs, or a fetched page, as text.
+    Without a name, list what there is."""
+    proj = scan_project(Path(args.project).expanduser())
+    pages = readable_pages(proj)
+    if not pages:
+        print("nothing to read yet -- `hackager fetch <url> <project> --follow`", file=sys.stderr)
+        return 2
+    if not args.page:
+        for f in pages:
+            n = f.stat().st_size
+            print(f"{n:>8}  {f.stem}" + ("   (empty -- nothing to read)" if n == 0 else ""))
+        return 0
+    hits = [f for f in pages if args.page.lower() in f.stem.lower()]
+    if len(hits) > 1:  # an exact stem match beats a substring: "pitch" over "pitch.draft"
+        exact = [f for f in hits if f.stem.lower() == args.page.lower()]
+        hits = exact or hits
+    if len(hits) != 1:
+        print(f"{'no' if not hits else len(hits)} page(s) match {args.page!r}: "
+              + ", ".join(f.stem for f in hits), file=sys.stderr)
+        return 1
+    print(hits[0].read_text())
+    return 0
+
+
+def cmd_set(args):
+    """Manifest fields from the command line -- the only way an LLM confined
+    to this tool can record the one-liner, problem, market, track, or the
+    hackathon's URL (`event`). Validated: an unknown key or a bad track is an
+    error, never a silent typo in the JSON."""
+    path = Path(args.project).expanduser()
+    target = path / MANIFEST
+    m = load_manifest(target) or {"name": path.name}
+    changed = []
+    for kv in args.pairs:
+        if "=" not in kv:
+            print(f"expected key=value, got {kv!r}", file=sys.stderr)
+            return 1
+        k, v = kv.split("=", 1)
+        if k not in MANIFEST_KEYS:
+            print(f"unknown field {k!r}; known: {', '.join(MANIFEST_KEYS)}", file=sys.stderr)
+            return 1
+        if k == "track" and v and v not in TRACKS:
+            print(f"track must be one of {', '.join(TRACKS)}", file=sys.stderr)
+            return 1
+        if k == "deadline" and v:
+            # ISO 8601 WITH an offset. A deadline without a timezone is how a
+            # whole night gets misreported: the clock was read in UTC and the
+            # offset added twice, and 06:42 was called 09:15.
+            try:
+                dt = datetime.fromisoformat(v)
+            except ValueError:
+                print("deadline must be ISO 8601 with an offset, e.g. 2026-10-11T09:30+08:00", file=sys.stderr)
+                return 1
+            if dt.tzinfo is None:
+                print("deadline needs a timezone offset, e.g. ...T09:30+08:00", file=sys.stderr)
+                return 1
+            v = dt.isoformat()
+        if m.get(k) != v:
+            m[k] = v
+            changed.append(k)
+    for k in MANIFEST_KEYS:
+        m.setdefault(k, "")
+    target.write_text(json.dumps(m, indent=2) + "\n")
+    print(("set " + ", ".join(changed)) if changed else "no change")
+    return 0
+
+
+def cmd_commit(args):
+    """`git add -A && git commit` for the project. Exit 2 when there is
+    nothing to commit -- a valid "no", not an error."""
+    path = Path(args.project).expanduser()
+    if not (path / ".git").exists():
+        print("not a git repo -- `hackager fix` first", file=sys.stderr)
+        return 1
+    if not git(path, ["status", "--porcelain"]):
+        print("nothing to commit")
+        return 2
+    # Default message names what changed, not "checkpoint" -- a log full of
+    # timestamps says nothing when someone reads it later.
+    # split(None, 1), not a fixed slice: git() strips its output, so the
+    # leading space of a " M path" line is already gone by here -- a fixed
+    # [3:] produced "ocs/" for docs/ on the first real run.
+    changed = sorted({(p := l.split(None, 1)[-1]).split("/")[0] + ("/" if "/" in p else "")
+                      for l in git(path, ["status", "--porcelain"]).splitlines() if l.strip()})
+    # Agents leave scripts, payloads and chunk files beside the inputs they were given;
+    # `git add -A` then sweeps them into history. Twice, on one project, before this
+    # warning existed. A workspace holds inputs and out/; name anything else.
+    untracked = [l for l in git(path, ["ls-files", "--others", "--exclude-standard"]).splitlines() if l.strip()]
+    debris = [u for u in untracked if re.match(r"workspace[^/]*/", u)
+              and not re.match(r"workspace[^/]*/(invoices/|out/|bank_statement\.csv$)", u)]
+    debris += [u for u in untracked if re.search(r"(^|/)(\.workbuddy-ai|chunks|batches)/", u)
+               or re.search(r"(^|/)(set_workspace.*\.json|gen_payload.*\.py|mcp_client\.py)$", u)]
+    debris = sorted(set(debris))
+    if debris and not args.no_check:
+        print(f"note: {len(debris)} untracked file(s) look like an agent's scratch, not source -- "
+              f"e.g. {debris[0]}" + (f" (+{len(debris)-1} more)" if len(debris) > 1 else "") +
+              ". Add them to .gitignore or remove them; committing anyway.", file=sys.stderr)
+    # What a pre-commit hook would have told you, without being one: the
+    # cached verify result, which is free to read. It WARNS rather than
+    # blocks -- committing work-in-progress that does not build yet is
+    # legitimate, and a gate you have to fight is a gate people disable.
+    # Only speaks up when code changed; a docs-only commit cannot break it.
+    if not args.no_check and any(not c.startswith("docs/") and c != MANIFEST for c in changed):
+        v = last_verify(scan_project(path))
+        # Keyed on the last code COMMIT, last_verify cannot see uncommitted
+        # edits -- it called a tree "verified" that had been edited since.
+        # The verify's own wall-clock time against the files' mtimes can.
+        if v is not None:
+            try:
+                ran = datetime.fromisoformat(v["at"]).timestamp()
+                newest = max((f.stat().st_mtime for f in (path / c.rstrip("/") for c in changed)
+                              if f.exists() and f.is_file()), default=0)
+                if newest > ran:
+                    v = None
+            except (ValueError, KeyError, OSError):
+                pass
+        if v is None:
+            print("note: code has changed since the last verify -- "
+                  f"`hackager verify {path}` before this is judged", file=sys.stderr)
+        elif not verify_ok(v):
+            bad = [k for k, ok in v["checks"].items() if not ok]
+            print(f"note: last verify was FAILING ({', '.join(bad)}) -- committing anyway",
+                  file=sys.stderr)
+    git(path, ["add", "-A"])
+    msg = args.message or ("hackager: update " + ", ".join(changed[:6])
+                           + (f" (+{len(changed) - 6} more)" if len(changed) > 6 else ""))
+    res = subprocess.run(["git", "-C", str(path), "commit", "-q", "-m", msg],
+                         capture_output=True, text=True, env=git_env())
+    if res.returncode != 0:
+        print(res.stderr.strip(), file=sys.stderr)
+        return 1
+    print(f"committed: {git(path, ['log', '-1', '--format=%h %s'])}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# verify: the project's OWN checks -- its tests, its build, its README --
+# not the six board gates. Stored under INTERNALS keyed by HEAD so `next`
+# can tell a passing verify from a stale one without re-running tests.
+
+def code_head(path):
+    """The last commit that touched CODE -- anything outside docs/ and the
+    manifest. verify and review are keyed on this, not HEAD: on the first
+    drive-through a docs-only `commit` moved HEAD and the loop re-ran the
+    tests and paid for a second review with nothing changed."""
+    return git(path, ["log", "-1", "--format=%h %ct", "--", ".", ":(exclude)docs",
+                      f":(exclude){MANIFEST}"])
+
+
+def verify_project(proj, timeout=600):
+    path = Path(proj["path"])
+    checks = {}
+    # The previous result, read WITHOUT the staleness check last_verify
+    # applies. A score baseline has to outlive the code change it is meant to
+    # catch: dropping it whenever HEAD moves would discard the number exactly
+    # when a regression became possible.
+    try:
+        last = json.loads((INTERNALS / f"{proj['name']}-verify.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        last = {}
+    readme = (path / "README.md").read_text(errors="replace") if (path / "README.md").is_file() else ""
+    checks["readme_setup"] = bool(re.search(r"^#+.*(setup|install|getting started|prerequisite)", readme, re.I | re.M))
+    checks["readme_run"] = bool(re.search(r"^#+.*(run|start|usage|quick ?start)", readme, re.I | re.M))
+    checks["license"] = proj["license"]
+    checks["gitignore"] = (path / ".gitignore").is_file()
+    # No rules_doc/brief_doc here: those are hackager's own bookkeeping, and
+    # `next` handles them. Fed into `review` as checks, a missing BRIEF on a
+    # project that was built before `build` existed read as a blocking gap.
+    # What the project itself says its build/test commands are.
+    cmds = []
+    pkg = path / "package.json"
+    if pkg.is_file():
+        try:
+            scripts = json.loads(pkg.read_text()).get("scripts", {})
+        except json.JSONDecodeError:
+            scripts = {}
+        if "build" in scripts:
+            cmds.append(("build", ["npm", "run", "build"]))
+        if "test" in scripts:
+            cmds.append(("test", ["npm", "test"]))
+        # A project that declares a quality gate gets it run. Not hackager's
+        # opinion of clean code -- the project's own, in its own words. Three
+        # of six real projects here declare `typecheck` or `check` and
+        # verify never ran them, so "verify: pass" was quieter than the repo.
+        for name in ("typecheck", "lint", "check", "format:check", "fmt:check"):
+            if name in scripts:
+                cmds.append((name.replace(":", "_"), ["npm", "run", name]))
+    if (path / "Cargo.toml").is_file():
+        cmds.append(("test", ["cargo", "test", "-q"]))
+    if (path / "go.mod").is_file():
+        cmds.append(("test", ["go", "test", "./..."]))
+    if (path / "pyproject.toml").is_file() or list(path.glob("tests/test_*.py")):
+        # Through the project's own runner, not bare system python. Averis
+        # locks its deps with uv, so `python3 -m pytest` found no pytest at
+        # all and verify reported FAILED for a suite of 129 tests that pass
+        # -- calling a good build broken, which is the worst direction for a
+        # checker to be wrong in.
+        def py_tool(tool, *args):
+            """The project's own way of running `tool`, or None if it has none.
+
+            None means SKIP, not fail. A tool the project never installed is
+            not a failing gate -- reporting `lint FAILED: command not found`
+            is the same false-failure that made verify call a passing suite
+            broken, and it would be worse here because it fires on projects
+            that never asked for a linter."""
+            if (path / "uv.lock").is_file() and shutil.which("uv"):
+                return ["uv", "run", tool, *args]
+            if (path / "poetry.lock").is_file() and shutil.which("poetry"):
+                return ["poetry", "run", tool, *args]
+            local = path / ".venv" / "bin" / tool
+            if local.is_file():
+                return [str(local), *args]
+            if shutil.which(tool):
+                return [tool, *args]
+            return None
+
+        if runner := py_tool("pytest", "-q"):
+            cmds.append(("test", runner))
+        # The quality gates this project declares for itself, same principle
+        # as reading package.json scripts for node. Missed before: a Python
+        # project's gates live in pyproject.toml sections, not in a scripts
+        # table, so verify ran tests only and reported green on a tree with
+        # seven real ruff violations in it.
+        pyproject = read_if(path / "pyproject.toml", 20000)
+        if "[tool.ruff" in pyproject:
+            for name, argv in (("lint", ("ruff", "check", ".")),
+                               ("format", ("ruff", "format", "--check", "."))):
+                if cmd := py_tool(*argv):
+                    cmds.append((name, cmd))
+        if "[tool.mypy" in pyproject and (cmd := py_tool("mypy")):
+            cmds.append(("typecheck", cmd))
+    # If the project has a grader and something to grade, score is a gate too.
+    # It was not, and that is how a scored entry can rot: tests, lint, format
+    # and typecheck all stay green while a classifier change quietly costs
+    # real points, because the one number the event actually judges was
+    # measured once by hand and never checked again.
+    sub = path / "submission.json"
+    if sub.is_file():
+        score_cmd, _ = score_plan({"path": str(path)})
+        if score_cmd:
+            cmds.append(("score", [str(sub) if c == "SUBMISSION_PATH" else c
+                                   for c in score_cmd]))
+
+    checks["has_tests"] = any(k == "test" for k, _ in cmds)
+    runs = []
+    for kind, cmd in cmds:
+        # A grader lives with its own imports and relative data paths, so it
+        # runs from its own directory; everything else runs from the project.
+        cwd = str(Path(cmd[1]).parent) if kind == "score" else str(path)
+        try:
+            r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+            out = r.stdout + r.stderr
+            ok, tail = r.returncode == 0, out.strip().splitlines()[-15:]
+        except (subprocess.SubprocessError, OSError) as e:
+            out, ok, tail = "", False, [str(e)]
+        entry = {"kind": kind, "cmd": " ".join(cmd), "ok": ok, "tail": tail}
+        if kind == "score" and ok:
+            # A grader reports; it does not judge. score_cli.py exits 0 whether
+            # the entry scores 1.0 or 0.1, so "it ran" is not a gate -- a
+            # deliberate 30-entry regression passed this check until the number
+            # itself was read. Compare against the last recorded score and fail
+            # on any drop; the first run has nothing to compare and just records.
+            m = re.search(r"FINAL SCORE\s+([0-9.]+)", out)
+            if m:
+                entry["score"] = float(m.group(1))
+                prev = (last or {}).get("score")
+                if prev is not None and entry["score"] < prev - 1e-9:
+                    ok = False
+                    entry["tail"] = [f"score dropped {prev:.4f} -> {entry['score']:.4f}"] + tail
+        runs.append(entry)
+        checks[f"{kind}_passes"] = ok
+    result = {"head": code_head(path), "checks": checks, "runs": runs,
+              "at": datetime.now().isoformat(timespec="seconds")}
+    # Carry the score forward at the top level: the baseline the next run
+    # compares against, kept even when this run did not score, so a project
+    # that temporarily loses its grader does not silently lose its floor.
+    scored = next((r["score"] for r in runs if r.get("score") is not None), None)
+    if scored is not None or last.get("score") is not None:
+        result["score"] = scored if scored is not None else last["score"]
+    INTERNALS.mkdir(exist_ok=True)
+    (INTERNALS / f"{proj['name']}-verify.json").write_text(json.dumps(result, indent=2))
+    return result
+
+
+def last_verify(proj):
+    f = INTERNALS / f"{proj['name']}-verify.json"
+    if not f.is_file():
+        return None
+    try:
+        r = json.loads(f.read_text())
+    except json.JSONDecodeError:
+        return None
+    if r.get("head") != code_head(Path(proj["path"])):
+        return None  # stale: the code moved since
+    return r
+
+
+def verify_ok(result):
+    if not result:
+        return False
+    c = result["checks"]
+    must = ["readme_setup", "readme_run", "license", "has_tests"]
+    must += [k for k in c if k.endswith("_passes")]
+    return all(c.get(k) for k in must)
+
+
+def cmd_verify(args):
+    proj = scan_project(Path(args.project).expanduser())
+    result = verify_project(proj, args.timeout)
+    ok = verify_ok(result)
+    if args.json:  # JSON only -- see cmd_doctor
+        print(json.dumps({**result, "pass": ok}, indent=2))
+        return 0 if ok else 1
+    for k, v in result["checks"].items():
+        print(f"  {'ok ' if v else 'MISSING'}  {k}")
+    for r in result["runs"]:
+        print(f"-- {r['cmd']}: {'ok' if r['ok'] else 'FAILED'}")
+        if not r["ok"]:
+            print("   " + "\n   ".join(r["tail"]))
+    print("verify: " + ("pass" if ok else "fail"))
+    return 0 if ok else 1
+
+
+# ---------------------------------------------------------------------------
+# LLM steps beyond pitch/learn. Each reads only what is in the project and
+# writes one file into its docs/. Sonnet, except `build`.
+
+def clip(text, n):
+    return text if len(text) <= n else text[:n] + f"\n\n[... clipped {len(text) - n} chars]"
+
+
+def file_summary(path, top=40):
+    """A tree an LLM can actually use, instead of a truncated file list.
+
+    `git ls-files` clipped at 6000 chars turns a data-heavy repo into noise:
+    Averis tracks 774 files (520 sample emails), so brief saw a fragment of
+    one directory and hedged about whether the dataset was even present.
+    Directory counts carry the shape in a fraction of the characters."""
+    files = [f for f in git(path, ["ls-files"]).splitlines() if f]
+    if not files:
+        return "(nothing tracked yet)"
+    dirs = {}
+    root = []
+    for f in files:
+        if "/" in f:
+            dirs.setdefault(f.rsplit("/", 1)[0], []).append(f)
+        else:
+            root.append(f)
+    out = [f"{len(files)} tracked files"]
+    out += sorted(root)[:top]
+    for d, group in sorted(dirs.items(), key=lambda kv: -len(kv[1]))[:top]:
+        sample = ", ".join(sorted(f.rsplit("/", 1)[1] for f in group)[:3])
+        out.append(f"{d}/  ({len(group)} files, e.g. {sample})")
+    return "\n".join(out)
+
+
+def read_if(path, n=60000):
+    try:
+        return clip(path.read_text(errors="replace"), n)
+    except OSError:
+        return ""
+
+
+def looks_like_doc(text, headings):
+    """Is this reply the document that was asked for? The first `brief` run
+    saved a one-line permission complaint as docs/BRIEF.md -- so a reply has
+    to have the shape of a document (length, sections, the headings the
+    prompt demanded) before it is allowed to become one."""
+    low = text.lower()
+    # re.M ^, not text.count("\n## "): a doc whose FIRST line is a heading
+    # lost one from the tally, so a short, correct NARRATION.md with exactly
+    # "## Shot list" + "## Script" scored 1 and was thrown away after paying
+    # for it. Only bit documents with few headings, which is why RULES.md
+    # (nine of them) never surfaced it.
+    return (len(text) > 300 and len(re.findall(r"^## ", text, re.M)) >= 2
+            and all(h.lower() in low for h in headings))
+
+
+def llm_to_file(args, proj, step, prompt, out, summary, headings=(), validate=None):
+    INTERNALS.mkdir(exist_ok=True)
+    (INTERNALS / f"{proj['name']}-{step}.txt").write_text(prompt)
+    if not args.yes and not confirm(summary, args.model):
+        print("cancelled")
+        return 2
+    ok, text, cost, raw = run_llm(prompt, Path(proj["path"]), args.model, args.timeout)
+    (INTERNALS / f"{proj['name']}-{step}.raw.jsonl").write_text(raw)
+    check = validate or (lambda t: looks_like_doc(t, headings))
+    if ok and not check(text):
+        ok = False
+        print(f"reply is not the document asked for (missing shape or headings "
+              f"{list(headings)}); NOT written:", file=sys.stderr)
+    if ok:
+        out.write_text(text)
+    print(text[:4000])
+    print(f"\n-> {out if ok else '(not written)'}\n-- cost: ${cost:.4f}")
+    return 0 if ok else 1
+
+
+RULES_SYSTEM = (
+    "You are distilling a hackathon's official pages into the working reference an entrant "
+    "will actually consult. Use ONLY the page text below; where the pages disagree, say so "
+    "and say which governs (official rules over marketing). Where something is not stated, "
+    "write 'not stated' -- never fill a gap from general knowledge. Output markdown with "
+    "exactly these headings: ## Dates, ## Eligibility, ## Tracks / what to build, "
+    "## Hard requirements on the repo and code, ## Submission form (every field they ask "
+    "for), ## Judging criteria (and any stated obvious-vs-creative guidance), ## Prizes, "
+    "## Intellectual property (quote the operative sentence), ## What this means for this "
+    "entry (5-10 bullets: the bar to hit, and what no tool can produce -- video, accounts, "
+    "forms). Under 150 lines. Quote key sentences verbatim where the wording matters.")
+
+
+def cmd_rules(args):
+    proj = scan_project(Path(args.project).expanduser())
+    pages = [f for f in reference_pages(proj) if f.stat().st_size > 0]
+    if not pages:
+        print("nothing fetched -- `hackager fetch <url> <project> --follow` first", file=sys.stderr)
+        return 1
+    # Empty files are skipped, not counted: the budget is split evenly across
+    # pages, so a 0-byte placeholder silently shrank the share of every real
+    # one. (A reference/readthis.md that never got pasted into did exactly
+    # that -- and read showed it as a page with content to offer.)
+    budget = 140000 // len(pages)
+    body = "\n\n".join(f"===== {f.stem}\n{read_if(f, budget)}" for f in pages)
+    out = project_docs(proj) / "RULES.md"
+    return llm_to_file(args, proj, "rules", RULES_SYSTEM + "\n\n" + body, out,
+                       f"rules: distil {len(pages)} fetched page(s) into {out}",
+                       headings=("## Dates", "## Eligibility", "## Judging", "## Intellectual"))
+
+
+IDEAS_SYSTEM = (
+    "You are helping a hackathon entrant decide WHAT to build. From the rules below, propose "
+    "exactly 5 genuinely different ideas -- different mechanisms, not five skins on one idea. "
+    "For each, use the heading `## N. <short name>` and then, in prose under it: what it is in "
+    "two sentences; which stated theme/track it answers and why; the single hardest technical "
+    "part (the thing that could sink it in the time available); why a judge would call it "
+    "creative rather than obvious, quoting the rules' own wording where they give any; and one "
+    "honest reason NOT to pick it. Spread the risk: at least one that is safe and certain to "
+    "finish, at least one that is ambitious and might not. Then close each idea with a fenced "
+    "```json block containing exactly the keys one_liner, problem, market, track -- track chosen "
+    "from: " + ", ".join(TRACKS) + ". No preamble, no conclusion, no ranking: the entrant "
+    "chooses, and under most hackathon rules the idea must be theirs, so do not argue for one.")
+
+
+def cmd_ideas(args):
+    proj = scan_project(Path(args.project).expanduser())
+    path = Path(proj["path"])
+    rules = path / "docs" / "RULES.md"
+    if not rules.is_file():
+        print("no docs/RULES.md -- `hackager rules` first", file=sys.stderr)
+        return 1
+    fixed, evidence = prescribed_problem(proj)
+    if fixed and not args.yes:
+        print(f"these rules dictate the deliverable and score it ({evidence}) -- there is probably "
+              f"no idea to choose here.\nif you want candidates anyway, re-run with -y; otherwise "
+              f"`hackager brief {proj['path']}`", file=sys.stderr)
+        return 2
+    out = project_docs(proj) / "IDEAS.md"
+    prompt = (IDEAS_SYSTEM + "\n\n===== docs/RULES.md\n" + read_if(rules)
+              + "\n\n===== anything already in this project (build on it if it is real)\n"
+              + read_if(path / "README.md", 6000))
+    return llm_to_file(args, proj, "ideas", prompt, out,
+                       f"ideas: propose 5 candidate ideas for {proj['name']} -> {out}",
+                       headings=("## 1.", "## 5."))
+
+
+# Not every hackathon asks what to build. Averis x Monash hands over a spec
+# (classify these emails, compare these 7 fields, match sample_submission.json)
+# and scores it with a formula -- there is no idea to choose, and proposing
+# five would be inviting someone to ignore the brief. These markers are the
+# ones an open-ended event's rules essentially never carry.
+PRESCRIBED_RE = re.compile(
+    r"macro-?f1|\bf1\b|precision/recall|\brmse\b|\bauc\b|leaderboard|ground truth|"
+    r"submission\.json|sample_submission|score_cli|accuracy score|held-out|test set|"
+    r"final score\s*=", re.I)
+
+
+def prescribed_problem(proj):
+    """(True, evidence) when the rules dictate the deliverable and score it."""
+    rules = Path(proj["path"]) / "docs" / "RULES.md"
+    try:
+        text = rules.read_text(errors="replace")
+    except OSError:
+        return False, ""
+    hits = sorted({h.lower() for h in PRESCRIBED_RE.findall(text)})
+    return (len(hits) >= 2), ", ".join(hits[:5])
+
+
+def idea_blocks(path):
+    """The fenced json block closing each idea, in order. Parsed, not guessed:
+    an idea whose block is malformed is dropped rather than half-applied.
+
+    Falls back to BRIEF.md, which emits the same shape: on a prescribed
+    problem there are no ideas to choose between, but the one-liner still has
+    to reach the manifest without anyone retyping it."""
+    for name in ("IDEAS.md", "BRIEF.md"):
+        try:
+            text = (path / "docs" / name).read_text()
+        except OSError:
+            continue
+        if "```json" in text:
+            break
+    else:
+        return []
+    out = []
+    for raw in re.findall(r"```json\s*(\{.*?\})\s*```", text, re.S):
+        try:
+            d = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(d, dict) and d.get("one_liner"):
+            out.append(d)
+    return out
+
+
+def cmd_pick(args):
+    """Copy one idea from docs/IDEAS.md into the manifest. This is the step
+    that used to be a human retyping a json block out of a doc -- the one
+    place the 'strictly hackager' workflow silently required a text editor."""
+    proj = scan_project(Path(args.project).expanduser())
+    path = Path(proj["path"])
+    ideas = idea_blocks(path)
+    if not ideas:
+        print(f"no usable ideas in docs/IDEAS.md -- `hackager ideas {path}` first", file=sys.stderr)
+        return 1
+    if args.n is None:
+        for i, d in enumerate(ideas, 1):
+            print(f"{i}. [{d.get('track', '-')}] {d['one_liner']}")
+        print("\npick one: hackager pick <project> <n>   (the idea has to be yours -- "
+              "edit it afterwards with `hackager set` if it is nearly right)")
+        return 0
+    if not 1 <= args.n <= len(ideas):
+        print(f"pick 1..{len(ideas)}", file=sys.stderr)
+        return 1
+    d = ideas[args.n - 1]
+    m = load_manifest(path / MANIFEST) or {"name": proj["name"]}
+    for k in ("one_liner", "problem", "market", "track"):
+        if d.get(k):
+            m[k] = d[k]
+    for k in MANIFEST_KEYS:
+        m.setdefault(k, "")
+    (path / MANIFEST).write_text(json.dumps(m, indent=2) + "\n")
+    print(f"picked {args.n}: {d['one_liner']}\n\nthis is now recorded as YOUR idea -- "
+          "reword it with `hackager set` so it is, before it reaches a judge.")
+    return 0
+
+
+BRIEF_SYSTEM = (
+    "You are the technical lead scoping a hackathon entry that a coding agent will then "
+    "build unattended. From the rules, the manifest, and whatever is in the repo, produce "
+    "the content of docs/BRIEF.md with exactly these headings: ## Idea (one paragraph; if the manifest's "
+    "one_liner is empty, propose ONE idea and label it PROPOSED -- the entrant must own the "
+    "idea under the rules, so say they must confirm or replace it), ## Track and why, "
+    "## Hard requirements this must satisfy (bullet each requirement from the rules and how "
+    "the design meets it -- runtime hooks, license, README, video), ## Bar for 'creative' "
+    "(map the judges' own obvious-vs-creative wording to concrete features), ## Spec "
+    "(stack pinned to versions known to exist, components, every tool/endpoint/screen, "
+    "persistence, tests -- deterministic, no network, no LLM calls in tests), ## Done means "
+    "(a checklist a script could verify: commands that must exit 0, files that must exist), "
+    "## Out of scope (what NOT to build), ## Manifest (a fenced json block with one_liner, "
+    "problem, market, track chosen from: " + ", ".join(TRACKS) + "). Be specific enough that "
+    "two different builders would produce the same shape. Under 120 lines.")
+
+
+def cmd_brief(args):
+    proj = scan_project(Path(args.project).expanduser())
+    path = Path(proj["path"])
+    rules = path / "docs" / "RULES.md"
+    if not rules.is_file():
+        print("no docs/RULES.md -- `hackager rules` first", file=sys.stderr)
+        return 1
+    out = project_docs(proj) / "BRIEF.md"
+    prompt = (BRIEF_SYSTEM + "\n\n===== hackathon.json\n" + json.dumps(proj["manifest"], indent=2)
+              + "\n\n===== docs/RULES.md\n" + read_if(rules)
+              + "\n\n===== README.md\n" + read_if(path / "README.md", 8000)
+              + "\n\n===== files already in this repo (data included -- do not "
+                "re-create what is here)\n" + file_summary(path))
+    return llm_to_file(args, proj, "brief", prompt, out, f"brief: scope the build and write {out}",
+                       headings=("## Idea", "## Spec", "## Done means", "## Manifest"))
+
+
+REVIEW_SYSTEM = (
+    "You are a hackathon judge doing a pre-submission review. Compare the repository "
+    "against docs/RULES.md and docs/BRIEF.md. Output markdown: ## Hard requirements "
+    "(a table: requirement | met? yes/no/partly | evidence -- a file path or command "
+    "output, never an assumption), ## Judging criteria (for each criterion, the honest "
+    "1-line assessment and the single change that would most improve it), ## Blocking "
+    "gaps (what would get this disqualified or ignored), ## Nice-to-have. Be blunt. "
+    "Under 100 lines. Use only what is below; if you cannot see it, say 'not visible'.")
+
+
+def cmd_review(args):
+    proj = scan_project(Path(args.project).expanduser())
+    path = Path(proj["path"])
+    v = last_verify(proj) or verify_project(proj)
+    out = project_docs(proj) / "REVIEW.md"
+    prompt = (REVIEW_SYSTEM
+              + "\n\n===== docs/RULES.md\n" + read_if(path / "docs" / "RULES.md")
+              + "\n\n===== docs/BRIEF.md\n" + read_if(path / "docs" / "BRIEF.md", 20000)
+              + "\n\n===== README.md\n" + read_if(path / "README.md", 20000)
+              + "\n\n===== verify (tests/build actually run)\n" + json.dumps(v, indent=2)
+              + "\n\n===== git ls-files\n" + clip(git(path, ["ls-files"]), 8000)
+              + "\n\n===== git log\n" + clip(git(path, ["log", "--oneline", "-30"]), 3000))
+    return llm_to_file(args, proj, "review", prompt, out, f"review: judge the repo against the rules -> {out}",
+                       headings=("## Hard requirements", "## Blocking gaps"))
+
+
+SUBMISSION_SYSTEM = (
+    "You are filling in a hackathon's submission form for an entrant. From the rules' "
+    "'Submission form' section, produce the content of docs/SUBMISSION.md with one ## heading per field "
+    "the form asks for, in the form's order, each filled from the repo/pitch/README below. "
+    "Where a field needs something that does not exist yet (a video URL, a live account, "
+    "a form only a human can submit), write 'TODO (human): ...' with exactly what is "
+    "needed -- never invent a URL or a result. For product-feedback style fields, use only "
+    "what the build report and README actually say happened. Under 150 lines.")
+
+
+def cmd_submission(args):
+    proj = scan_project(Path(args.project).expanduser())
+    path = Path(proj["path"])
+    out = project_docs(proj) / "SUBMISSION.md"
+    prompt = (SUBMISSION_SYSTEM
+              + "\n\n===== docs/RULES.md\n" + read_if(path / "docs" / "RULES.md")
+              + "\n\n===== hackathon.json\n" + json.dumps(proj["manifest"], indent=2)
+              + "\n\n===== docs/PITCH.md\n" + read_if(path / "docs" / "PITCH.md", 12000)
+              + "\n\n===== README.md\n" + read_if(path / "README.md", 20000)
+              + "\n\n===== docs/BUILD-REPORT.md\n" + read_if(path / "docs" / "BUILD-REPORT.md", 12000))
+    return llm_to_file(args, proj, "submission", prompt, out, f"submission: draft the form answers -> {out}")
+
+
+BUILD_SYSTEM = (
+    "You are building a hackathon entry, unattended, inside the current directory, which is "
+    "an existing git repo. Follow docs/BRIEF.md as the spec and docs/RULES.md as the "
+    "constraints; where they conflict, RULES wins. Rules for you:\n"
+    "- Work ONLY inside this directory. Do not touch LICENSE, hackathon.json, or anything "
+    "under docs/ except reading it. Do not create a remote or push.\n"
+    "- Commit in logical phases with plain, specific messages. No Co-Authored-By or "
+    "'generated by' trailers.\n"
+    "- Never fabricate: if something does not work, leave it out or mark it clearly in the "
+    "README. Run the project's own build and tests before finishing and make them pass.\n"
+    "- Write the test for a behaviour BEFORE the code that satisfies it, and commit it failing, "
+    "so the test describes the requirement instead of describing whatever the code happened to "
+    "do. A test written afterwards is shaped by the implementation and proves much less.\n"
+    "- If the project declares typecheck/lint/format scripts, they must pass too -- and add them "
+    "if the stack has an obvious one, since a judge cloning this reads the code.\n"
+    "- README.md must have real ## Setup and ## Run sections (commands that work), the "
+    "architecture in a few lines, and a short 'what is real / what is not' section.\n"
+    "- The rules' runtime-hook requirement means the track's required technology is "
+    "imported AND called in code, not just named.\n"
+    "- Finish with a plain report: commands run, last lines of test output, git log "
+    "--oneline, and anything left out.")
+
+
+def cmd_build(args):
+    """The long one. Refuses without a BRIEF (so the idea has been seen and,
+    per the rules, owned by the entrant) and on a dirty tree (so the commits
+    it makes are attributable to this run). Everything else about safety is
+    in run_llm_agent: cwd-bound tools, budget and turn caps."""
+    proj = scan_project(Path(args.project).expanduser())
+    path = Path(proj["path"])
+    brief = path / "docs" / "BRIEF.md"
+    if not brief.is_file():
+        print("no docs/BRIEF.md -- `hackager brief` first (and confirm the idea is yours)",
+              file=sys.stderr)
+        return 1
+    if proj["dirty"]:
+        print(f"{proj['dirty']} uncommitted change(s) -- `hackager commit` first so the build "
+              f"starts from a clean tree", file=sys.stderr)
+        return 1
+    model = args.model or BUILD_LLM_MODEL
+    prompt = (BUILD_SYSTEM + "\n\n===== docs/BRIEF.md\n" + read_if(brief)
+              + "\n\n===== docs/RULES.md\n" + read_if(path / "docs" / "RULES.md")
+              + "\n\n===== hackathon.json\n" + json.dumps(proj["manifest"], indent=2))
+    INTERNALS.mkdir(exist_ok=True)
+    (INTERNALS / f"{proj['name']}-build.txt").write_text(prompt)
+    if not args.yes and not confirm(
+            f"build: let {model} write code in {path} for up to ${args.budget:.0f} / {args.max_turns} "
+            f"turns (Read/Edit/Write/Bash allowed there, no prompts)", model, cost="real cost, real edits"):
+        print("cancelled")
+        return 2
+    before = git(path, ["rev-parse", "--short", "HEAD"])
+    ok, text, cost, raw = run_llm_agent(prompt, path, model, args.timeout, args.budget, args.max_turns)
+    (INTERNALS / f"{proj['name']}-build.raw.jsonl").write_text(raw)
+    report = project_docs(proj) / "BUILD-REPORT.md"
+    log = git(path, ["log", "--oneline", f"{before}..HEAD"]) if before else git(path, ["log", "--oneline"])
+    report.write_text(f"# build report -- {model}, ${cost:.2f}\n\n{text}\n\n## commits this run\n"
+                      f"{log or '(none)'}\n")
+    print(f"\n-> {report}\n-- cost: ${cost:.4f}")
+    return 0 if ok else 1
+
+
+# ---------------------------------------------------------------------------
+# doctor: preflight. Shape taken from umcares/doctor.py, whose opening line is
+# the whole argument -- "Every check here exists because that thing actually
+# broke once" -- and whose Check carries a FIX, not just a verdict. Every
+# entry below is something that failed during this tool's own development:
+# pip refusing system Python (PEP 668), no PDF engine on the machine at all,
+# opencode with no credentials, vhs needing ffmpeg and ttyd.
+#
+# Without this an agent meets each one serially, mid-workflow, after paying
+# for the LLM steps that came before it.
+
+class Check:
+    def __init__(self, name, ok, detail="", fix="", needed_for=""):
+        self.name, self.ok, self.detail, self.fix = name, ok, detail, fix
+        self.needed_for = needed_for
+
+    def as_dict(self):
+        return {"check": self.name, "ok": self.ok, "detail": self.detail,
+                "fix": self.fix, "needed_for": self.needed_for}
+
+
+def doctor_checks():
+    out = []
+    for tool, fix, why in (
+            ("claude", "npm i -g @anthropic-ai/claude-code, then log in",
+             "rules, brief, build, review, pitch, learn, submission, demo, narrate"),
+            ("git", "xcode-select --install", "everything"),
+            ("gh", "brew install gh && gh auth login", "publish"),
+            ("vhs", "brew install vhs", "demo"),
+            ("ffmpeg", "brew install ffmpeg", "demo (vhs encodes with it; contact sheets)"),
+            ("ttyd", "brew install ttyd", "demo (vhs drives a headless terminal with it)"),
+            ("pandoc", "brew install pandoc", "pdf")):
+        p = shutil.which(tool)
+        out.append(Check(tool, bool(p), p or "not found", "" if p else fix, why))
+
+    # The venv, not system python: pip refuses system Python here (PEP 668),
+    # correctly, and --break-system-packages is not the answer.
+    venv_fix = (f"cd {SELF.parent} && python3 -m venv .venv && "
+                f".venv/bin/pip install weasyprint python-pptx")
+    out.append(Check("pdftotext", bool(shutil.which("pdftotext")), shutil.which("pdftotext") or "missing",
+                     "brew install poppler", "rules: reading a brief that arrived as a PDF"))
+    out.append(Check("tesseract", bool(shutil.which("tesseract")), shutil.which("tesseract") or "missing",
+                     "brew install tesseract", "rules: reading a brief that arrived as screenshots (optional; "
+                     "paste the text into docs/reference/*.txt instead)"))
+    out.append(Check(".venv", VENV_PY.exists(), str(VENV_PY) if VENV_PY.exists() else "missing",
+                     "" if VENV_PY.exists() else venv_fix, "slides, pdf"))
+    for mod, why in (("pptx", "slides"), ("weasyprint", "pdf")):
+        if not VENV_PY.exists():
+            out.append(Check(f".venv {mod}", False, "no venv", venv_fix, why))
+            continue
+        r = subprocess.run([str(VENV_PY), "-c", f"import {mod}"], capture_output=True)
+        out.append(Check(f".venv {mod}", r.returncode == 0,
+                         "importable" if r.returncode == 0 else "not installed",
+                         "" if r.returncode == 0 else f"{VENV_PY.parent}/pip install "
+                         f"{'python-pptx' if mod == 'pptx' else mod}", why))
+
+    if shutil.which("gh"):
+        r = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True)
+        ok = r.returncode == 0
+        who = re.search(r"account (\S+)", r.stdout + r.stderr)
+        out.append(Check("gh auth", ok, (who.group(1) if who and ok else "not logged in"),
+                         "" if ok else "gh auth login", "publish"))
+    root_dir = Path(default_root())
+    out.append(Check("projects root", root_dir.is_dir(), str(root_dir),
+                     "" if root_dir.is_dir() else f"mkdir -p {root_dir}", "scan, report, board"))
+    return out
+
+
+def cmd_doctor(args):
+    checks = doctor_checks()
+    bad = [c for c in checks if not c.ok]
+    # --json means JSON on stdout and NOTHING else: a trailing human summary
+    # makes the whole thing unparseable, which is exactly the bug this file
+    # already carries a note about for `board --json`.
+    if args.json:
+        print(json.dumps({"ok": not bad, "checks": [c.as_dict() for c in checks]}, indent=2))
+        return 1 if bad else 0
+    for c in checks:
+        print(f"  {'ok     ' if c.ok else 'MISSING'}  {c.name:<16} {c.detail[:52]}")
+        if not c.ok:
+            print(f"           needed for: {c.needed_for}")
+            print(f"           fix: {c.fix}")
+    print(f"doctor: {len(checks) - len(bad)}/{len(checks)} ok"
+          + (f" -- broken: {', '.join(c.name for c in bad)}" if bad else ""))
+    return 1 if bad else 0
+
+
+# ---------------------------------------------------------------------------
+# deploy: the OTHER half of the demo gate. `demo` makes a video; for a web
+# app the judge wants a URL they can open. hackager does not reimplement any
+# platform -- same principle as verify (runs the project's own test command)
+# and demo (runs the project's own commands): it runs the project's own
+# deploy script and reads the URL out of what that prints.
+
+def deploy_plan(proj):
+    """(cmd, label) or (None, why-not). Detection is from files that exist,
+    never a guess -- and the project's own script wins over any platform CLI,
+    because the script is what its author actually runs."""
+    path = Path(proj["path"])
+    scripts = {}
+    if (path / "package.json").is_file():
+        try:
+            scripts = json.loads((path / "package.json").read_text()).get("scripts", {})
+        except (OSError, json.JSONDecodeError):
+            scripts = {}
+    if "deploy" in scripts:
+        return ["npm", "run", "deploy"], f"the project's own `deploy` script: {scripts['deploy']}"
+    if any((path / f).is_file() for f in ("wrangler.jsonc", "wrangler.toml", "wrangler.json")):
+        return ["npx", "wrangler", "deploy"], "wrangler config present, no deploy script"
+    if (path / "vercel.json").is_file():
+        return ["vercel", "--prod"], "vercel.json present, no deploy script"
+    return None, ("no deploy script and no wrangler/vercel config -- nothing here says how this "
+                  "project is meant to be deployed, and guessing would be worse than stopping")
+
+
+def cmd_deploy(args):
+    proj = scan_project(Path(args.project).expanduser())
+    path = Path(proj["path"])
+    cmd, why = deploy_plan(proj)
+    if cmd is None:
+        print(why, file=sys.stderr)
+        print("if this project is not a deployable service, its demo is a video: "
+              f"`hackager demo {path}`", file=sys.stderr)
+        return 2
+    if not shutil.which(cmd[0]):
+        print(f"{cmd[0]} not installed", file=sys.stderr)
+        return 1
+    if not args.yes and not confirm(f"deploy: run `{' '.join(cmd)}` in {path}\n  ({why})",
+                                    model=None, llm=False,
+                                    cost="outward-facing: publishes to the internet and spends "
+                                         "your own account's quota"):
+        print("cancelled")
+        return 2
+    res = subprocess.run(cmd, cwd=str(path), capture_output=True, text=True, timeout=args.timeout)
+    out = (res.stdout or "") + (res.stderr or "")
+    print(out.strip()[-3000:])
+    if res.returncode != 0:
+        print("deploy failed", file=sys.stderr)
+        return 1
+    # The URL comes out of the deploy's own output or not at all -- never
+    # composed from a project name and a guessed domain.
+    urls = [u.strip().strip("*_,.") for u in DEMO_RE.findall(out)]
+    if not urls:
+        print("\ndeployed, but no URL matched in the output -- set it by hand:\n"
+              f"  hackager set {path} demo=<url>", file=sys.stderr)
+        return 1
+    url = urls[-1]
+    m = load_manifest(path / MANIFEST) or {"name": proj["name"]}
+    m["demo"] = url
+    for k in MANIFEST_KEYS:
+        m.setdefault(k, "")
+    (path / MANIFEST).write_text(json.dumps(m, indent=2) + "\n")
+    print(f"\ndemo -> {url}  (recorded in hackathon.json)")
+    print("open it yourself before submitting: a deploy that returns 500 still deploys.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# score: the project's own grader, if it has one. Same principle as verify and
+# deploy -- run what the project already provides, never reimplement scoring.
+# Distinct from both: the script commonly lives OUTSIDE the repo (an
+# organizer's private bundle with an answer key, as on Averis x Monash) and
+# must never be assumed to be safe to commit -- score does not touch git.
+
+SCORE_HINTS = ("score_cli.py", "score.py", "scripts/score.py", "grade.py", "evaluate.py")
+
+
+def score_plan(proj):
+    """(cmd, label) or (None, why-not). An organizer's grader bundle is
+    commonly extracted beside the repo, not inside it -- as with
+    sdoc-hackathon-docker/server/score_cli.py, two levels below the project
+    root -- so this walks a few levels deep, name-matched only, never
+    entering .git/node_modules/.venv (a name check alone is not enough: the
+    first version checked one level and missed a grader sitting one deeper)."""
+    path = Path(proj["path"])
+    skip = {".git", "node_modules", ".venv", "__pycache__", "dist", "build"}
+    hits = []
+    for depth in range(4):
+        for f in path.glob("/".join(["*"] * depth + ["*"]) if depth else "*"):
+            if f.is_file() and f.name in SCORE_HINTS and not (skip & set(p.name for p in f.parents)):
+                hits.append(f)
+        if hits:
+            break
+    if not hits:
+        return None, "no score_cli.py / score.py / grade.py / evaluate.py found in the project or "\
+                     "nearby -- if the organizers gave you a grader under another name, run it "\
+                     "yourself; this only matches those names"
+    return ["python3", str(hits[0]), "SUBMISSION_PATH"], f"found {hits[0].relative_to(path)}"
+
+
+def cmd_score(args):
+    proj = scan_project(Path(args.project).expanduser())
+    path = Path(proj["path"])
+    sub = Path(args.submission).expanduser() if args.submission else path / "submission.json"
+    if not sub.is_file():
+        print(f"no submission file at {sub} -- build one first, or pass --submission", file=sys.stderr)
+        return 1
+    cmd, why = score_plan(proj)
+    if cmd is None:
+        print(why, file=sys.stderr)
+        return 2
+    cmd = [str(sub) if c == "SUBMISSION_PATH" else c for c in cmd]
+    print(f"{why}: {' '.join(cmd)}")
+    res = subprocess.run(cmd, cwd=str(Path(cmd[1]).parent), capture_output=True, text=True,
+                         timeout=args.timeout)
+    print((res.stdout or res.stderr).strip())
+    return res.returncode
+
+
+def cmd_publish(args):
+    """Create the GitHub repo and push -- the `source` gate, and the one step
+    here that is outward-facing, so it confirms first. Uses `gh`, which must
+    already be logged in; nothing here stores credentials."""
+    path = Path(args.project).expanduser()
+    proj = scan_project(path)
+    if proj["remote"]:
+        print(f"already has a remote: {proj['remote']}")
+        return 2
+    if not shutil.which("gh"):
+        print("gh not installed", file=sys.stderr)
+        return 1
+    vis = "--private" if args.private else "--public"
+    if not args.yes and not confirm(f"publish: gh repo create {path.name} {vis} --source {path} --push",
+                                    model=None, llm=False, cost="pushes this repo to GitHub"):
+        print("cancelled")
+        return 2
+    res = subprocess.run(["gh", "repo", "create", path.name, vis, "--source", str(path), "--push"],
+                         capture_output=True, text=True)
+    if res.returncode != 0:
+        print(res.stderr.strip(), file=sys.stderr)
+        return 1
+    url = git(path, ["remote", "get-url", "origin"]).removesuffix(".git")
+    m = load_manifest(path / MANIFEST)
+    if m and not m.get("source"):
+        m["source"] = url
+        (path / MANIFEST).write_text(json.dumps(m, indent=2) + "\n")
+    print(f"published -> {url}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# next: the driver. One step at a time, in the order a project actually
+# needs, so an LLM confined to this tool never has to know the workflow --
+# it runs `next`, runs what it says, runs `next` again. --json for machines.
+
+PROBLEM_WORDS = re.compile(r"person|problem|loss|who hurts|owner|bookkeeper|accountant|customer|patient|"
+                           r"student|teacher|farmer|nurse|driver|shop|pain|costs?|loses?|told|chase", re.I)
+MECHANISM_WORDS = re.compile(r"\b(mcp|api|server|tool|verifier|dashboard|model|llm|agent|framework|sdk)\b", re.I)
+
+
+def pitch_problem_first(card):
+    """Why a finished entry still lost: the pitch opened on the mechanism. Returns a complaint
+    (str) or '' when the card's first content slide is about a person and a loss. Checked
+    on the card, not the deck: the deck is built from it. Slide 1 is the cover; slide 2 must
+    name who hurts; slides 2-3 must carry a number and must not name the machinery."""
+    try:
+        text = card.read_text(errors="replace")
+    except OSError:
+        return "no pitch card"
+    secs = re.split(r"^## +", text, flags=re.M)[1:]
+    if len(secs) < 3:
+        return "pitch card has fewer than three sections"
+    title2, body2 = (secs[1].split("\n", 1) + [""])[:2]
+    first_two = secs[1] + "\n" + secs[2]
+    if not PROBLEM_WORDS.search(title2 + " " + body2[:200]):
+        return f"slide 2 ({title2.strip()[:40]!r}) is not about a person or a problem -- the deck must open on who hurts"
+    if not re.search(r"\d", first_two):
+        return "slides 2-3 carry no number -- a loss without a number is a feeling"
+    hit = MECHANISM_WORDS.search(first_two)
+    if hit:
+        return f"slides 2-3 name the machinery ({hit.group(0)!r}) -- keep the first two slides about the person"
+    return ""
+
+
+CUE_RE = re.compile(r"^\*\*(\d+):(\d\d)\s*[—-]+\s*\[?([^\]*]*)\]?\*\*\s*(.*)$", re.M)
+SCREEN_WORDS = re.compile(r"\b(demo|screen|click|paste|run the|tool|mcp|url|slide \d|browser|terminal|type the)\b", re.I)
+GENERIC_QUESTIONS = [
+    "Who exactly has this problem, and what does one instance of it cost them?",
+    "What did you build that someone could not get by calling an API themselves?",
+    "Who pays for this, and why would they pay you rather than their existing vendor?",
+    "What breaks first if a hundred people use it tomorrow?",
+    "What did you cut, and what would you build next week?",
+    "Show me the moment it was wrong. What happened?",
+]
+
+
+def cmd_archive(args):
+    """Snapshot an agent run as evidence: every out/ directory under the project, copied to
+    runs/NN-<date>-<label>/ with a README listing what was kept and, when the project has a
+    scorer and an exceptions.json, the score. Invented by hand at 2 a.m. the first time;
+    `git add -A` had been sweeping the agent's scratch files into history instead."""
+    path = Path(args.project).expanduser()
+    outs = [d for d in path.rglob("out") if d.is_dir() and ".git" not in d.parts and "node_modules" not in d.parts
+            and ".venv" not in d.parts and "runs" not in d.parts]
+    if not outs:
+        print("no out/ directory to archive", file=sys.stderr); return 2
+    runs = path / "runs"; runs.mkdir(exist_ok=True)
+    n = 1 + max([int(d.name.split("-")[0]) for d in runs.iterdir() if d.is_dir() and d.name[:2].isdigit()] or [0])
+    label = re.sub(r"[^A-Za-z0-9]+", "-", args.label).strip("-").lower() or "run"
+    dest = runs / f"{n:02d}-{datetime.now().strftime('%Y-%m-%d')}-{label}"
+    kept = []
+    for o in outs:
+        rel = o.relative_to(path)
+        target = dest / (rel.parent.name + "-out" if rel.parent != path else "out")
+        shutil.copytree(o, target)
+        kept += [str(f.relative_to(dest)) for f in target.rglob("*") if f.is_file()]
+    lines = [f"# Run {n} -- {datetime.now().strftime('%Y-%m-%d %H:%M')} -- {args.label}", "",
+             args.note or "(what happened, which server, what it proved and what it exposed)", "",
+             "## Kept"] + [f"- {k}" for k in sorted(kept)]
+    scorer = path / "datagen" / "score.py"
+    exc = next((f for f in dest.rglob("exceptions.json")), None)
+    if scorer.is_file() and exc:
+        res = subprocess.run([sys.executable, str(scorer), str(exc)], capture_output=True, text=True, cwd=path)
+        lines += ["", "## Score", "```", (res.stdout + res.stderr).strip(), "```"]
+    (dest / "README.md").write_text("\n".join(lines) + "\n")
+    print(f"-> {dest.relative_to(path)}  ({len(kept)} files)")
+    return 0
+
+
+def cmd_judges(args):
+    """The panel as data. Two judges can score the same pitch differently; a founder who
+    runs an accounting firm and a research engineer hear different openers. Stored in
+    docs/reference/judges.json; `pitch` feeds it to the coach and `rehearse` drills from it."""
+    proj = scan_project(Path(args.project).expanduser())
+    ref = project_docs(proj) / "reference"; ref.mkdir(parents=True, exist_ok=True)
+    jf = ref / "judges.json"
+    judges = []
+    if jf.is_file():
+        try:
+            judges = json.loads(jf.read_text())
+        except json.JSONDecodeError:
+            judges = []
+    for spec in args.add or []:
+        parts = [x.strip() for x in spec.split("|")]
+        if len(parts) < 2:
+            print(f"expected 'Name | Role[, Org] | lens', got {spec!r}", file=sys.stderr)
+            return 1
+        j = {"name": parts[0], "role": parts[1], "lens": parts[2] if len(parts) > 2 else ""}
+        judges = [x for x in judges if x.get("name") != j["name"]] + [j]
+    if args.add:
+        jf.write_text(json.dumps(judges, indent=2) + "\n")
+    if args.json:
+        print(json.dumps(judges, indent=2)); return 0
+    if not judges:
+        print("no judges recorded -- `hackager judges <proj> --add 'Name | Role | lens'`"); return 2
+    for j in judges:
+        print(f"  {j['name']:<28} {j['role']:<40} {j.get('lens','')}")
+    return 0
+
+
+def cmd_rehearse(args):
+    """Say it out loud, timed, before anyone else hears it. The weekend this was written, a
+    finished entry opened on the mechanism, skipped the written problem opener, and lost on
+    'tell us more about the problem'. Reads docs/PITCH_SCRIPT.md (or the pitch card), checks
+    the shape (total length; the first 30 seconds are a person and a loss, not a screen), then
+    runs the cues as a timer and a judge-question drill. Writes docs/REHEARSAL.md. Exit 2 when
+    the shape or the timing fails: a valid 'not yet'."""
+    proj = scan_project(Path(args.project).expanduser())
+    docs = project_docs(proj)
+    script = docs / "PITCH_SCRIPT.md"
+    card = pitch_card(proj)
+    if not script.is_file():
+        if card is None or is_scaffold(card):
+            print("no docs/PITCH_SCRIPT.md and no pitch card -- `hackager pitch` first", file=sys.stderr)
+            return 1
+        print(f"no docs/PITCH_SCRIPT.md; checking the card's shape only", file=sys.stderr)
+    problems = []
+    cues = []
+    if script.is_file():
+        text = script.read_text(errors="replace")
+        for m in CUE_RE.finditer(text):
+            at = int(m.group(1)) * 60 + int(m.group(2))
+            cues.append({"at": at, "cue": m.group(3).strip(), "line": m.group(4).strip()})
+        if not cues:
+            problems.append("no timed cues found (expected lines like `**0:20 — [slide 2]** ...`)")
+        else:
+            last = cues[-1]["at"]
+            if last > args.limit:
+                problems.append(f"last cue at {last//60}:{last%60:02d} is past the {args.limit//60}:{args.limit%60:02d} limit")
+            # spoken words only: a cue like "[slide 1 up, dark]" is a stage direction, not a screen
+            opener = " ".join(c["line"] for c in cues if c["at"] < 30)
+            hit = SCREEN_WORDS.search(opener)
+            if hit:
+                problems.append(f"the first 30 seconds mention {hit.group(0)!r}: open on a person and a loss, no screen, no tool")
+            if not re.search(r"\d", opener):
+                problems.append("the first 30 seconds carry no number: say what it costs")
+    if card is not None and not is_scaffold(card):
+        c = pitch_problem_first(card)
+        if c:
+            problems.append("card: " + c)
+    judges = []
+    jf = docs / "reference" / "judges.json"
+    if jf.is_file():
+        try:
+            judges = json.loads(jf.read_text())
+        except json.JSONDecodeError:
+            pass
+    questions = list(GENERIC_QUESTIONS)
+    rules = docs / "RULES.md"
+    if rules.is_file():
+        crit = re.search(r"## Judging.*?(?=^## |\Z)", rules.read_text(errors="replace"), re.S | re.M)
+        if crit:
+            for line in crit.group(0).splitlines():
+                line = line.strip("-* ").strip()
+                if 12 < len(line) < 140 and not line.startswith("#"):
+                    questions.append(f"The rules score '{line[:100]}'. Where is that in your two minutes?")
+    for j in judges[:8]:
+        who = j.get("name", "a judge"); lens = j.get("lens") or j.get("role") or ""
+        if lens:
+            questions.append(f"{who} ({lens}) asks: what in this is new to someone who does {lens.lower()} every day?")
+
+    report = [f"# Rehearsal -- {proj['name']} -- {datetime.now().strftime('%Y-%m-%d %H:%M')}", ""]
+    if problems:
+        report.append("## Shape")
+        report += [f"- {p}" for p in problems]
+        report.append("")
+    for p in problems:
+        print(f"shape: {p}", file=sys.stderr)
+    if args.check:
+        report.append("(shape check only; no timed run)")
+        (docs / "REHEARSAL.md").write_text("\n".join(report) + "\n")
+        return 2 if problems else 0
+
+    # the timed run: one cue at a time, Enter to advance, the clock does not lie
+    print("\nRehearsal. Press Enter at each cue when you reach it; say the words out loud.\n")
+    import time
+    t0 = None; timings = []
+    for c in cues:
+        label = f"[{c['at']//60}:{c['at']%60:02d}] {c['cue']}"
+        try:
+            input(f"  -> {label}\n     {c['line'][:160]}\n     (Enter when you start this cue) ")
+        except EOFError:
+            break
+        now = time.monotonic()
+        if t0 is None:
+            t0 = now
+        actual = int(now - t0)
+        drift = actual - c["at"]
+        timings.append({"cue": c["cue"], "planned": c["at"], "actual": actual, "drift": drift})
+        print(f"     {actual//60}:{actual%60:02d} ({'+' if drift >= 0 else ''}{drift}s)")
+    if timings:
+        total = timings[-1]["actual"]
+        report.append("## Timing")
+        report += [f"- {t['cue']}: planned {t['planned']//60}:{t['planned']%60:02d}, said at {t['actual']//60}:{t['actual']%60:02d} ({'+' if t['drift']>=0 else ''}{t['drift']}s)" for t in timings]
+        over = total > args.limit
+        report.append(f"- last cue reached at {total//60}:{total%60:02d}" + (" -- OVER" if over else ""))
+        report.append("")
+        if over:
+            problems.append(f"ran to {total//60}:{total%60:02d}, over the limit")
+    # the drill: answer out loud; the point is hearing yourself not have an answer
+    print("\nJudge drill. Answer each out loud, then Enter.\n")
+    report.append("## Questions drilled")
+    import random
+    random.shuffle(questions)
+    for q in questions[: args.questions]:
+        try:
+            input(f"  ? {q}\n    ")
+        except EOFError:
+            break
+        report.append(f"- {q}")
+    report.append("")
+    report.append("verdict: " + ("NOT YET -- " + "; ".join(problems) if problems else "ready"))
+    (docs / "REHEARSAL.md").write_text("\n".join(report) + "\n")
+    print(f"\n-> {docs / 'REHEARSAL.md'}")
+    return 2 if problems else 0
+
+
+def deadline_left(m):
+    """The submission deadline as time remaining, or None. Read from the
+    manifest, never guessed: `next` prints it first because the one thing an
+    agent driving this tool got wrong for hours was the clock."""
+    raw = (m or {}).get("deadline")
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        return None
+    now = datetime.now(dt.tzinfo)
+    secs = int((dt - now).total_seconds())
+    if secs <= 0:
+        text = "PASSED"
+    else:
+        d, r = divmod(secs, 86400); h, r = divmod(r, 3600); mi = r // 60
+        text = (f"{d}d {h}h" if d else f"{h}h {mi:02d}m")
+    return {"deadline": dt.isoformat(), "seconds_left": secs, "left": text,
+            "local": dt.strftime("%a %d %b %H:%M %z"), "urgent": 0 < secs < 2 * 3600}
+
+
+def next_step(proj):
+    path = Path(proj["path"])
+    m = proj["manifest"] or {}
+    docs = path / "docs"
+    _, gates = readiness(proj)
+    name = proj["name"]
+
+    def step(cmd, why, human=False, step_name=""):
+        return {"project": name, "step": step_name or cmd.split()[1], "cmd": cmd, "why": why,
+                "needs_human": human}
+
+    if not proj["git"] or not gates["license"]:
+        return step(f"hackager fix {path}", "no git repo / LICENSE yet -- mechanical, free")
+    if not reference_pages(proj):
+        if m.get("event"):
+            return step(f"hackager fetch {m['event']} {path} --follow",
+                        "rules not fetched yet; --follow gets the rules/terms/dates pages too")
+        return step(f"hackager set {path} event=<hackathon url>",
+                    "no hackathon URL known; only a human knows which event this is for", human=True)
+    if not (docs / "RULES.md").is_file():
+        return step(f"hackager rules {path}", "pages fetched but not distilled (LLM, sonnet)")
+    # An existing project brought in from outside (or built before `build`
+    # existed) has its spec in the code; a brief is only for what is not
+    # built yet. Without this, `next` sent a finished repo back to `brief`.
+    has_code = bool(proj["stack"]) or any((path / d).is_dir() for d in ("src", "app", "lib", "cmd"))
+    # Choosing WHAT to build comes before specifying how. Five candidates and
+    # a pick beat one proposal: a single suggestion invites a rubber stamp,
+    # and most of these events require the idea to be the entrant's own.
+    if not has_code and not m.get("one_liner"):
+        fixed, evidence = prescribed_problem(proj)
+        if fixed:
+            # Must still check for the brief, or this branch loops forever on
+            # a project that already has one -- which it did, immediately.
+            if not (docs / "BRIEF.md").is_file():
+                return step(f"hackager brief {path}", "the rules dictate the deliverable and score "
+                            f"it ({evidence}) -- there is no idea to choose, so brief scopes the "
+                            "build straight from the spec")
+            return step(f"hackager pick {path} 1", "the spec is scoped; `pick` copies the one-liner "
+                        "out of docs/BRIEF.md's Manifest block so it does not have to be retyped",
+                        human=True)
+        if not (docs / "IDEAS.md").is_file():
+            return step(f"hackager ideas {path}", "nothing decided yet -- 5 candidate ideas read from "
+                        "the rules (LLM, sonnet); you choose, the tool does not rank them")
+        return step(f"hackager pick {path} <n>", f"docs/IDEAS.md has the candidates (`hackager pick "
+                    f"{path}` lists them) -- choosing is yours, and under most rules the idea must "
+                    "be the entrant's own", human=True)
+    if not has_code and not (docs / "BRIEF.md").is_file():
+        return step(f"hackager brief {path}", "idea chosen, no build spec yet (LLM, sonnet)")
+    empty = [k for k in ("problem", "market", "track") if not m.get(k)]
+    if empty:
+        hint = ("`hackager pick` fills these from the chosen idea"
+                if (docs / "IDEAS.md").is_file() else "describe what the existing code does")
+        return step(f"hackager set {path} " + " ".join(f"{k}=..." for k in empty),
+                    f"manifest fields empty: {', '.join(empty)} -- {hint}", human=True)
+    if not has_code:
+        if proj["dirty"]:
+            return step(f"hackager commit {path} -m \"docs: rules, brief, manifest\"",
+                        "build starts from a clean tree; commit the docs first")
+        return step(f"hackager build {path}", f"spec exists, no code -- long agentic run (LLM, "
+                    f"{BUILD_LLM_MODEL}), confirms budget first")
+    v = last_verify(proj)
+    if v is None:
+        return step(f"hackager verify {path}", "code changed since last verify (or never verified) -- runs "
+                    "the project's own build/tests, free")
+    if not verify_ok(v):
+        bad = [k for k, ok in v["checks"].items() if not ok]
+        return step(f"hackager build {path}", f"verify failing: {', '.join(bad)} -- another build pass, or "
+                    "fix by hand and `hackager verify` again", human=True)
+    review = docs / "REVIEW.md"
+    # Stale = older than the last COMMIT. Not older than the .git directory:
+    # scan_project's own `git status` refreshes .git/index on every call, so
+    # that comparison made every review look stale and `next` re-ran the
+    # LLM review 11 times in a row on the first real drive-through.
+    last_code_commit = int((code_head(path).split() or ["", "0"])[-1])
+    if not review.is_file() or review.stat().st_mtime < last_code_commit:
+        return step(f"hackager review {path}", "verified but not judged against the rules yet (LLM, sonnet)")
+    card = pitch_card(proj)
+    if card is None or is_scaffold(card):
+        return step(f"hackager pitch {path}", "PITCH.md is still the skeleton (LLM, sonnet)")
+    complaint = pitch_problem_first(card)
+    if complaint:
+        return step(f"(edit {card.relative_to(path)}: {complaint})",
+                    "judges score the why before the how; this gate exists because a working entry lost on "
+                    "exactly this", human=True, step_name="pitch")
+    if not (docs / "SUBMISSION.md").is_file():
+        return step(f"hackager submission {path}", "no form answers drafted (LLM, sonnet)")
+    if not (docs / f"{name}.pptx").is_file():
+        return step(f"hackager slides {path}", "no deck yet -- free")
+    if not (docs / f"{name}-slides.pdf").is_file():
+        return step(f"hackager pdf {path} --slides", "no slide deck as PDF yet (the form usually wants one) -- free")
+    script = docs / "PITCH_SCRIPT.md"
+    reh = docs / "REHEARSAL.md"
+    if script.is_file() and (not reh.is_file() or reh.stat().st_mtime < script.stat().st_mtime
+                             or "verdict: ready" not in reh.read_text(errors="replace")):
+        return step(f"hackager rehearse {path}", "the script has not been said out loud, timed, since it last "
+                    "changed -- the one step no tool can do for you, and the one this gate exists for", human=True)
+    if proj["dirty"]:
+        return step(f"hackager commit {path}", f"{proj['dirty']} uncommitted change(s)")
+    if not gates["source"]:
+        return step(f"hackager publish {path}", "no public repo yet (confirms before pushing)")
+    if not gates["demo"]:
+        # A deployable service and a CLI want different demos. Ask the project
+        # which it is rather than assuming every entry is a video: three of
+        # these projects ship as Workers and their demo is a URL a judge opens.
+        cmd, _ = deploy_plan(proj)
+        if cmd:
+            return step(f"hackager deploy {path}", "this project has its own deploy path, so its "
+                        "demo is a live URL -- deploy records it in the manifest (confirms first)")
+        media = sorted((docs / "media").glob("demo.*")) if (docs / "media").is_dir() else []
+        if not media:
+            return step(f"hackager demo {path}", "no demo video yet -- writes a VHS tape from this "
+                        "project's own commands and renders it (real footage, re-renderable)")
+        if not (docs / "NARRATION.md").is_file():
+            return step(f"hackager narrate {path}", "footage exists but no spoken script, cued to "
+                        "the tape's real timings (LLM, sonnet)")
+        return step("(watch docs/media/demo.mp4, upload to YouTube/Vimeo, then "
+                    "`hackager set ... demo=<url>`)",
+                    "the footage is rendered; uploading it is outward-facing and yours",
+                    human=True, step_name="demo")
+    return step("(submit on the hackathon site using docs/SUBMISSION.md)",
+                "all gates green", human=True, step_name="done")
+
+
+def cmd_next(args):
+    proj = scan_project(Path(args.project).expanduser())
+    s = next_step(proj)
+    dl = deadline_left(proj["manifest"])
+    if dl:
+        s["deadline"] = dl
+    if args.json:
+        print(json.dumps(s, indent=2))
+    else:
+        if dl:
+            # Red under two hours, when every step has to be weighed against
+            # pressing submit; a tool that knows the deadline should not let
+            # the agent guess it.
+            line = f"deadline: {dl['local']} -- " + ("PASSED" if dl["left"] == "PASSED" else f"{dl['left']} left")
+            print(f"\033[31m{line}\033[0m" if dl["urgent"] or dl["left"] == "PASSED" else line)
+        elif s["step"] != "done":
+            print("deadline: not set -- `hackager set <proj> deadline=2026-10-11T09:30+08:00`")
+        print(s["cmd"])
+        print(f"  why: {s['why']}" + ("  [needs a human]" if s["needs_human"] else ""))
+    return 0 if s["step"] != "done" else 2
+
+
+AGENT_CONTRACT = [
+    "Run `hackager doctor --json` once before starting. Every failure names what it blocks and "
+    "how to fix it; a missing dependency found here costs nothing, found mid-workflow it costs "
+    "the LLM steps you already paid for.",
+    "Drive the workflow with `hackager next <project>` (add --json for a machine-readable step). "
+    "Run the command it prints, then run `next` again. Do not skip ahead.",
+    "After `demo`, LOOK at docs/media/demo-contact.jpg before reporting the video as done -- it "
+    "is a tiled grid of frames with their timestamps, made so a vision-capable model can check "
+    "the footage itself. A tape that recorded an error renders exactly like one that worked.",
+    "Exit codes: 0 ok; 1 error (read stderr); 2 = a valid 'no' -- cancelled, nothing to do, or `next` "
+    "reporting done. 2 is not a failure.",
+    "Every output goes into the project's own docs/. Never write into hackathon-manager.",
+    "Commands with llm set cost money and ask `proceed? [y/N]` on stdin; pass -y only when the human "
+    "has already agreed to the spend. `build` uses Opus and can run long; it takes --budget and --max-turns.",
+    "The idea, the demo video, the platform account and the final form submission are the human's. "
+    "`next` says needs_human=true when it reaches one of those; stop and report instead of inventing.",
+    "Read fetched pages with `hackager read <project> [page]`; set manifest fields with "
+    "`hackager set <project> key=value`. Do not edit hackathon.json or docs/ by other means.",
+]
+
+CMD_META = {
+    "board": {"writes": ["hackathon-manager/BOARD.md"]},
+    "new": {"writes": ["<root>/<name>/*"]}, "init": {"writes": ["hackathon.json"]},
+    "fix": {"writes": ["LICENSE", "docs/PITCH.md", ".git"]},
+    "set": {"writes": ["hackathon.json"]},
+    "fetch": {"writes": ["docs/reference/*.html", "docs/reference/*.txt"]},
+    "rules": {"writes": ["docs/RULES.md"], "llm": "sonnet"},
+    "ideas": {"writes": ["docs/IDEAS.md"], "llm": "sonnet"},
+    "pick": {"writes": ["hackathon.json: one_liner, problem, market, track"]},
+    "brief": {"writes": ["docs/BRIEF.md"], "llm": "sonnet"},
+    "build": {"writes": ["<any code file>", "docs/BUILD-REPORT.md", "git commits"], "llm": "opus"},
+    "review": {"writes": ["docs/REVIEW.md"], "llm": "sonnet"},
+    "pitch": {"writes": ["docs/PITCH.md or docs/PITCH.draft.md"], "llm": "sonnet"},
+    "learn": {"writes": ["docs/INSIGHTS.md"], "llm": "sonnet"},
+    "submission": {"writes": ["docs/SUBMISSION.md"], "llm": "sonnet"},
+    "demo": {"writes": ["docs/demo.tape", "docs/media/demo.mp4", "docs/media/demo.gif",
+                        "docs/media/demo-contact.jpg"],
+             "llm": "sonnet (only to write the tape; rendering is free)"},
+    "narrate": {"writes": ["docs/NARRATION.md"], "llm": "sonnet"},
+    "slides": {"writes": ["docs/<name>.pptx"]}, "pdf": {"writes": ["<pitch>.pdf", "docs/<name>-slides.pdf (--slides)"]},
+    "rehearse": {"writes": ["docs/REHEARSAL.md"]},
+    "judges": {"writes": ["docs/reference/judges.json"]},
+    "archive": {"writes": ["runs/NN-<date>-<label>/"]},
+    "commit": {"writes": ["git commit"]},
+    "publish": {"writes": ["GitHub repo", "hackathon.json:source"]},
+    "deploy": {"writes": ["a live deployment", "hackathon.json:demo"]},
+    "score": {"writes": []},
+}
+
+
+def cmd_schema(args, ap=None):
+    """The contract, derived from argparse itself so it cannot drift from
+    the real flags -- plus what each command writes and whether it spends."""
+    cmds = {}
+    for action in ap._subparsers._group_actions:
+        # add_parser(help=...) lands on the subparsers action's choice list,
+        # not on the sub-parser's .description -- reading the latter gave an
+        # empty help for all 24 commands on the first check of this output.
+        helps = {c.dest: c.help or "" for c in getattr(action, "_choices_actions", [])}
+        for name, sp in action.choices.items():
+            meta = CMD_META.get(name, {})
+            args = []
+            for a in sp._actions:
+                if a.dest == "help":
+                    continue
+                entry = {"flags": a.option_strings or [a.dest], "help": a.help or "",
+                         "required": bool(a.required) if a.option_strings else a.nargs not in ("?", "*")}
+                if a.choices:
+                    entry["choices"] = list(a.choices)
+                if a.default not in (None, argparse.SUPPRESS, DEFAULT, False):
+                    entry["default"] = a.default
+                args.append(entry)
+            cmds[name] = {"help": helps.get(name, ""), "args": args,
+                          "writes": meta.get("writes", []), "llm": meta.get("llm")}
+    out = {"tool": "hackager", "version": 2,
+           "exit_codes": {"0": "ok", "1": "error", "2": "valid no (cancelled / nothing to do / done)"},
+           "workflow": ["fix", "set event=", "fetch --follow", "rules", "brief", "set one_liner= ...",
+                        "commit", "build", "verify", "review", "pitch", "submission", "slides", "pdf",
+                        "commit", "publish", "(human: demo video)", "(human: submit)"],
+           "agent_contract": AGENT_CONTRACT, "commands": cmds}
+    print(json.dumps(out, indent=2))
+    return 0
+
+
+def default_root():
+    candidate = Path.home() / "Projects" / "Hackathon"
+    return str(candidate) if candidate.is_dir() else "."
+
+
+def cmd_board(args):
+    projects = [scan_project(p) for p in discover(root(args.dir))]
+    rows = []
+    for p in projects:
+        state, steps = readiness(p)
+        m = p["manifest"] or {}
+        missing = [k for k, v in steps.items() if not v]
+        market = (m.get("market") or "-").replace("|", "\\|")[:40]
+        demo = (m.get("demo") or (p["demo_links"] or ["-"])[0])[:40]
+        dl = deadline_left(m)
+        rows.append({"name": p["name"], "state": state, "missing": missing,
+                     "market": market, "demo": demo,
+                     "deadline": (dl["left"] if dl else "-"),
+                     "deadline_at": (dl["deadline"] if dl else None)})
+
+    # --json was accepted (it comes from the shared `common` parser every
+    # subcommand takes) but had no effect at all -- the flag existed, nothing
+    # behind it. `board --json --stdout` silently printed the same markdown as
+    # a bare `board`. scan/report/check all honour --json for real; this is
+    # the same shape, not a special case.
+    if args.json:
+        payload = {"ts": datetime.now().isoformat(timespec="seconds"),
+                   "count": len(rows), "projects": rows}
+        if args.stdout:
+            print(json.dumps(payload, indent=2))
+            return 0
+        out = SELF.parent / "BOARD.json"
+        out.write_text(json.dumps(payload, indent=2) + "\n")
+        print(f"board -> {out}")
+        return 0
+
+    # Columns padded to width. Raw markdown pipes are fine for a file a
+    # renderer will lay out, but this is read as plain text in a panel, where
+    # a ragged table is just noise -- 'DeepTech' and 'Docs-of-Agents' put
+    # every following column in a different place on each line.
+    #
+    # The panel's --row pattern has to tolerate the padding that follows;
+    # hackager-popup matches '^| ([%w%-]+)%s*|' for exactly that reason. Any
+    # change to this shape needs that pattern changed with it, which is the
+    # argument against letting the engine pad tables instead: it would break
+    # every panel's row matching at once, invisibly.
+    # `deadline` sits third, before `missing`: when a narrow panel sheds
+    # columns from the right it is the last thing a board should lose.
+    header = ("project", "state", "deadline", "missing", "market", "demo")
+    body = [[r["name"], r["state"], r["deadline"], ", ".join(r["missing"]) or "-", r["market"], r["demo"]]
+            for r in rows]
+
+    # Fit the panel. panvim hands every render command PANVIM_COLS and has
+    # since it was written; nothing had ever read it, so this board was 153
+    # columns wide in an 80-column panel and you scrolled sideways to reach
+    # the state of your own projects.
+    #
+    # 80 of those 153 were `market` and `demo`, padded to 40 each while being
+    # "-" in most rows. A column nobody has filled in is not information, so
+    # it is dropped -- and comes back by itself the moment one row has a
+    # value. project and state always stay: they are the board.
+    # Only the panel is width-bound. BOARD.md is a file that markdown
+    # renderers and GitHub lay out themselves, so fitting it to whatever
+    # terminal happened to run `hackager board` made a tracked file's
+    # contents depend on the environment: generated at 60 columns it lost the
+    # demo column outright and ellipsised real market text, permanently, in
+    # the copy that gets committed. The file gets every column at full width.
+    cols = 10**6
+    if args.stdout:
+        cols = int(os.environ.get("PANVIM_COLS") or 0) or \
+            shutil.get_terminal_size((100, 24)).columns
+    keep = [i for i in range(len(header))
+            if i < 2 or any(r[i] not in ("-", "") for r in body)]
+    header = tuple(header[i] for i in keep)
+    body = [[r[i] for i in keep] for r in body]
+
+    widths = [len(h) for h in header]
+    for r in body:
+        widths = [max(w, len(c)) for w, c in zip(widths, r)]
+
+    # Still over? Take it out of the widest column, which is the one with the
+    # least to lose per character: an ellipsis on a long market description
+    # beats a project name scrolled off the right edge.
+    def total(ws):
+        return sum(ws) + 3 * len(ws) + 1
+
+    # Column 0 is never shrunk. It is the project name, and hackager-popup's
+    # --row pattern reads it to build a path: truncating 'AmazonAppDev2026'
+    # to 'AmazonAppDev2…' does not merely look wrong, it stops the pattern
+    # matching at all ('…' is not a word character), so every row-keyed
+    # command in the panel goes dead. Checked, before it shipped.
+    while total(widths) > cols and max(widths[1:], default=0) > 8:
+        i = 1 + widths[1:].index(max(widths[1:]))
+        widths[i] -= 1
+        body = [[(c[: widths[j] - 1] + "…") if j == i and len(c) > widths[j] else c
+                 for j, c in enumerate(r)] for r in body]
+
+    # Narrower than every column's floor: shed columns from the right rather
+    # than overflow. A 60-column panel gets project/state/missing, which is
+    # the board's actual question -- what is left to do -- and not a market
+    # description squeezed to eight characters and scrolled off anyway.
+    while total(widths) > cols and len(widths) > 3:
+        widths.pop()
+        header = header[:-1]
+        body = [r[:-1] for r in body]
+
+    def line(cells, dash=False):
+        return "| " + " | ".join("-" * w if dash else c.ljust(w)
+                                 for c, w in zip(cells, widths)) + " |"
+
+    lines = ["# Hackathon board",
+             f"_hackager {datetime.now().strftime('%Y-%m-%d %H:%M')}_",
+             "",
+             line(header),
+             line(header, dash=True)]
+    lines += [line(r) for r in body]
+    text = "\n".join(lines) + "\n"
+    if args.stdout:
+        print(text, end="")
+        return 0
+    out = SELF.parent / "BOARD.md"
+    out.write_text(text)
+    print(f"board -> {out}")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="hackager", description="hackathon manager - business-oriented readiness board")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", help="emit JSON envelopes")
+
+    p = sub.add_parser("scan", parents=[common], help="discover projects and extract signals")
+    p.add_argument("dir", nargs="?", default=DEFAULT)
+    p.set_defaults(fn=cmd_scan)
+
+    p = sub.add_parser("report", parents=[common], help="business-oriented readiness board")
+    p.add_argument("dir", nargs="?", default=DEFAULT)
+    p.set_defaults(fn=cmd_report)
+
+    p = sub.add_parser("init", parents=[common], help="scaffold a hackathon.json business manifest for a project")
+    p.add_argument("project")
+    p.add_argument("--source")
+    p.add_argument("--demo")
+    p.add_argument("--track", choices=TRACKS)
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(fn=cmd_init)
+
+    p = sub.add_parser("new", parents=[common], help="scaffold a brand-new project from nothing: git repo, LICENSE, "
+                       "README, hackathon.json, docs/PITCH.md")
+    p.add_argument("name")
+    p.add_argument("dir", nargs="?", default=DEFAULT)
+    p.add_argument("--track", choices=TRACKS)
+    p.set_defaults(fn=cmd_new)
+
+    p = sub.add_parser("fix", parents=[common], help="mechanically fix what an existing project is missing -- a real "
+                       "LICENSE, a real PITCH.md skeleton, `git init` -- and report what still needs a human")
+    p.add_argument("project")
+    p.set_defaults(fn=cmd_fix)
+
+    p = sub.add_parser("check", parents=[common], help="exit 1 if any project is not submission-ready")
+    p.add_argument("dir", nargs="?", default=DEFAULT)
+    p.set_defaults(fn=cmd_check)
+
+    p = sub.add_parser("pitch", parents=[common], help="LLM wrapper: draft a judge-ready pitch card -> <project>/docs/PITCH.md "
+                       "(or PITCH.draft.md beside one already filled in)")
+    p.add_argument("project")
+    p.add_argument("--model", help=f"claude model alias or full name (default: {DEFAULT_LLM_MODEL})")
+    p.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt (real API call, real cost)")
+    p.add_argument("--timeout", type=int, default=300)
+    p.set_defaults(fn=cmd_pitch)
+
+    p = sub.add_parser("learn", parents=[common], help="LLM wrapper: mine git history (deployment excluded) into a "
+                       "development narrative -> <project>/docs/INSIGHTS.md")
+    p.add_argument("project")
+    p.add_argument("--model", help=f"claude model alias or full name (default: {DEFAULT_LLM_MODEL})")
+    p.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt (real API call, real cost)")
+    p.add_argument("--timeout", type=int, default=300)
+    p.set_defaults(fn=cmd_learn)
+
+    p = sub.add_parser("board", parents=[common], help="regenerate the self-updating hackathon board (stdout with --stdout)")
+    p.add_argument("dir", nargs="?", default=DEFAULT)
+    p.add_argument("--stdout", action="store_true", help="print the board to stdout instead of writing BOARD.md")
+    p.set_defaults(fn=cmd_board)
+
+    p = sub.add_parser("slides", parents=[common], help="build a real .pptx from the project's docs/PITCH.md -> "
+                       "<project>/docs/<name>.pptx (python-pptx, free)")
+    p.add_argument("project")
+    p.set_defaults(fn=cmd_slides)
+
+    p = sub.add_parser("pdf", parents=[common], help="markdown -> PDF beside it (pandoc + weasyprint); "
+                       "give a project dir to render its docs/PITCH.md")
+    p.add_argument("target", help="a .md file, or a project directory")
+    p.add_argument("-o", "--out", help="output path (default: same name, .pdf)")
+    p.add_argument("--slides", action="store_true", help="a 16:9 slide deck PDF, one page per ##, "
+                   "with image, ::stamp and ::cat directives -> docs/<name>-slides.pdf")
+    p.set_defaults(fn=cmd_pdf)
+
+    p = sub.add_parser("archive", parents=[common], help="snapshot an agent run's out/ as evidence -> "
+                       "runs/NN-<date>-<label>/ with a README and the score if there is a scorer")
+    p.add_argument("project")
+    p.add_argument("label")
+    p.add_argument("--note", help="one paragraph: what happened, what it proved, what it exposed")
+    p.set_defaults(fn=cmd_archive)
+
+    p = sub.add_parser("judges", parents=[common], help="the panel as data -> docs/reference/judges.json; "
+                       "pitch and rehearse read it")
+    p.add_argument("project")
+    p.add_argument("--add", action="append", metavar="'Name | Role | lens'")
+    p.set_defaults(fn=cmd_judges)
+
+    p = sub.add_parser("rehearse", parents=[common], help="say the pitch out loud, timed, with a judge-question "
+                       "drill; checks the first 30 s are a person and a loss, not a screen -> docs/REHEARSAL.md")
+    p.add_argument("project")
+    p.add_argument("--limit", type=int, default=120, help="seconds allowed (default 120)")
+    p.add_argument("--questions", type=int, default=5, help="how many judge questions to drill")
+    p.add_argument("--check", action="store_true", help="shape only: no timer, no drill")
+    p.set_defaults(fn=cmd_rehearse)
+
+    p = sub.add_parser("fetch", parents=[common], help="read a URL (stdlib GET, no scraping stack) -> "
+                       "<project>/docs/reference/<host_path>.html")
+    p.add_argument("url")
+    p.add_argument("project", help="the project this page is evidence for")
+    p.add_argument("--follow", action="store_true", help="also fetch same-site pages whose path looks like "
+                   "rules/terms/dates/resources/faq (max 12)")
+    p.add_argument("--timeout", type=int, default=15)
+    p.set_defaults(fn=cmd_fetch)
+
+    p = sub.add_parser("read", parents=[common], help="print a fetched page as text (no page arg: list them)")
+    p.add_argument("project")
+    p.add_argument("page", nargs="?", help="substring of the page name")
+    p.set_defaults(fn=cmd_read)
+
+    p = sub.add_parser("set", parents=[common], help="set hackathon.json fields: key=value ... "
+                       f"(keys: {', '.join(MANIFEST_KEYS)})")
+    p.add_argument("project")
+    p.add_argument("pairs", nargs="+", metavar="key=value")
+    p.set_defaults(fn=cmd_set)
+
+    def llm_flags(p, default=DEFAULT_LLM_MODEL, timeout=300):
+        p.add_argument("--model", help=f"claude model alias or full name (default: {default})")
+        p.add_argument("-y", "--yes", action="store_true", help="skip the confirmation prompt (real API call, real cost)")
+        p.add_argument("--timeout", type=int, default=timeout)
+
+    p = sub.add_parser("rules", parents=[common], help="LLM: distil docs/reference/*.txt -> docs/RULES.md")
+    p.add_argument("project"); llm_flags(p); p.set_defaults(fn=cmd_rules)
+
+    p = sub.add_parser("ideas", parents=[common], help="LLM: 5 candidate ideas read from docs/RULES.md "
+                       "-> docs/IDEAS.md; you choose with `pick`, the tool does not rank them")
+    p.add_argument("project"); llm_flags(p); p.set_defaults(fn=cmd_ideas)
+
+    p = sub.add_parser("pick", parents=[common], help="copy one idea from docs/IDEAS.md into the manifest "
+                       "(no number: list them)")
+    p.add_argument("project")
+    p.add_argument("n", nargs="?", type=int)
+    p.set_defaults(fn=cmd_pick)
+
+    p = sub.add_parser("brief", parents=[common], help="LLM: RULES + manifest -> docs/BRIEF.md, the build spec "
+                       "(proposes an idea if one_liner is empty; the entrant must own it)")
+    p.add_argument("project"); llm_flags(p); p.set_defaults(fn=cmd_brief)
+
+    p = sub.add_parser("verify", parents=[common], help="run the project's own build/tests + README/LICENSE checks; "
+                       "free; `next` relies on it")
+    p.add_argument("project")
+    p.add_argument("--timeout", type=int, default=600)
+    p.set_defaults(fn=cmd_verify)
+
+    p = sub.add_parser("review", parents=[common], help="LLM: judge the repo against docs/RULES.md -> docs/REVIEW.md")
+    p.add_argument("project"); llm_flags(p); p.set_defaults(fn=cmd_review)
+
+    p = sub.add_parser("submission", parents=[common], help="LLM: draft the platform's form answers -> docs/SUBMISSION.md")
+    p.add_argument("project"); llm_flags(p); p.set_defaults(fn=cmd_submission)
+
+    p = sub.add_parser("demo", parents=[common], help="the demo video: write docs/demo.tape if missing "
+                       "(LLM, from the project's real commands), then render it with vhs -> "
+                       "docs/media/demo.mp4 + .gif")
+    p.add_argument("project"); llm_flags(p)
+    p.add_argument("--write-only", action="store_true", help="write the tape, do not render")
+    p.add_argument("--render-timeout", type=int, default=900)
+    p.set_defaults(fn=cmd_demo)
+
+    p = sub.add_parser("narrate", parents=[common], help="LLM: the spoken script for the demo, cued to the "
+                       "tape's own real timings -> docs/NARRATION.md")
+    p.add_argument("project"); llm_flags(p); p.set_defaults(fn=cmd_narrate)
+
+    p = sub.add_parser("commit", parents=[common], help="git add -A && commit in the project (exit 2 if clean)")
+    p.add_argument("project")
+    p.add_argument("-m", "--message")
+    p.add_argument("--no-check", action="store_true", help="skip the stale/failing verify note")
+    p.set_defaults(fn=cmd_commit)
+
+    p = sub.add_parser("build", parents=[common], help=f"LLM ({BUILD_LLM_MODEL}): build the project from docs/BRIEF.md, "
+                       "unattended, inside the project only; writes docs/BUILD-REPORT.md")
+    p.add_argument("project"); llm_flags(p, BUILD_LLM_MODEL, timeout=3600)
+    p.add_argument("--budget", type=float, default=15.0, help="max USD to spend (default 15)")
+    p.add_argument("--max-turns", type=int, default=300)
+    p.set_defaults(fn=cmd_build)
+
+    p = sub.add_parser("deploy", parents=[common], help="run the project's OWN deploy script (or its "
+                       "wrangler/vercel config) and record the URL it prints as the demo; confirms first")
+    p.add_argument("project")
+    p.add_argument("-y", "--yes", action="store_true")
+    p.add_argument("--timeout", type=int, default=900)
+    p.set_defaults(fn=cmd_deploy)
+
+    p = sub.add_parser("score", parents=[common], help="run the project's OWN grader against "
+                       "submission.json (never invents scoring, never touches an answer key)")
+    p.add_argument("project")
+    p.add_argument("--submission", help="default: <project>/submission.json")
+    p.add_argument("--timeout", type=int, default=120)
+    p.set_defaults(fn=cmd_score)
+
+    p = sub.add_parser("doctor", parents=[common], help="preflight every dependency; each failure "
+                       "reports what it blocks and how to fix it (exit 1 if anything is missing)")
+    p.set_defaults(fn=cmd_doctor)
+
+    p = sub.add_parser("next", parents=[common], help="the one next command for this project, and why (--json)")
+    p.add_argument("project")
+    p.set_defaults(fn=cmd_next)
+
+    p = sub.add_parser("publish", parents=[common], help="gh repo create + push; sets manifest source (confirms first)")
+    p.add_argument("project")
+    p.add_argument("--private", action="store_true")
+    p.add_argument("-y", "--yes", action="store_true")
+    p.set_defaults(fn=cmd_publish)
+
+    p = sub.add_parser("schema", parents=[common], help="machine-readable contract: commands, args, writes, "
+                       "exit codes, agent_contract")
+    p.set_defaults(fn=lambda a: cmd_schema(a, ap))
+
+    args = ap.parse_args()
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
